@@ -30,8 +30,11 @@ permissions:
 
 env:
   SDK_ASSET: rexglue-sdk-source-f5337cdc-7bb14d86c7e0.tar.xz
-  SDK_SHA256: f97856b3afee5ff23114b43b6dbaa3f44d9ea8b26121f3b63b25ed9a4ed844eb
-  SDK_RELEASE: https://github.com/RenanQueiroz/mcla-recomp/releases/download/v0.3.12
+  SDK_SHA256: d4fd9dae9220fdf6682fbde8ac4486d1ef4a4203fb6e6be9eedf9cebaa11b059
+  SDK_RELEASE: https://github.com/RenanQueiroz/mcla-recomp/releases/download/v0.3.13
+  # The fork's commit the archive must hold (its fork/ is the game's host code).
+  FORK_COMMIT: d246b7db0af4284e89b971fc3fd94df0c7a92a01
+  SYNCTHING_VERSION: v2.1.7
   MOLTENVK_URL: https://github.com/KhronosGroup/MoltenVK/releases/download/v1.4.2/MoltenVK-ios.tar
   DEPLOYMENT_TARGET: "17.0"
 
@@ -57,6 +60,8 @@ jobs:
           mkdir src-archive
           tar -xJf "$SDK_ASSET" -C src-archive --strip-components=1
           rm "$SDK_ASSET"
+          grep -q "$FORK_COMMIT" src-archive/SOURCE-INFO.json \
+            || { echo "the archive holds another fork commit:"; grep forkCommit src-archive/SOURCE-INFO.json; exit 1; }
           cd src-archive/sdk
           # The archive has no .git folders; the SDK's CMake takes one in each
           # third-party folder as the sign that the submodule is there.
@@ -69,6 +74,26 @@ jobs:
             echo "applying $(basename "$patch")"
             patch -p1 --no-backup-if-mismatch < "$patch"
           done
+
+      - uses: actions/setup-go@v5
+        with:
+          go-version: "1.26.x"
+          cache: false
+
+      - name: Save sync (Syncthing as a C archive)
+        run: |
+          git clone --quiet --depth 1 --branch "$SYNCTHING_VERSION" https://github.com/syncthing/syncthing.git syncthing
+          mkdir -p syncthing/cmd/mclasync
+          cp sync/mclasync.go syncthing/cmd/mclasync/
+          cd syncthing
+          sdk=$(xcrun --sdk iphoneos --show-sdk-path)
+          export CGO_ENABLED=1 GOOS=ios GOARCH=arm64
+          export CC="$(xcrun --sdk iphoneos -f clang) -isysroot $sdk -arch arm64 -miphoneos-version-min=$DEPLOYMENT_TARGET"
+          export CGO_LDFLAGS="-arch arm64"
+          go version
+          go build -trimpath -tags "noupgrade,sqlite_omit_load_extension" -ldflags "-s -w" \
+            -buildmode=c-archive -o "$GITHUB_WORKSPACE/mclasync/libmclasync.a" ./cmd/mclasync
+          ls -la "$GITHUB_WORKSPACE/mclasync"
 
       - name: MoltenVK
         run: |
@@ -120,6 +145,7 @@ jobs:
             -DREXSDK_DIR="$PWD/src-archive/sdk" \
             -DMCLA_FORK_DIR="$PWD/src-archive/fork" \
             -DMCLA_GENERATED_DIR="$PWD/private/generated" \
+            -DMCLA_SYNC_LIB="$PWD/mclasync/libmclasync.a" \
             -DMCLA_BUNDLE_VERSION="${{ github.run_number }}"
 
       - name: Build the runtime

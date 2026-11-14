@@ -75,23 +75,33 @@ file(CREATE_LINK "${MCLA_GENERATED_DIR}" "${CMAKE_CURRENT_BINARY_DIR}/include/ge
      SYMBOLIC)
 
 # --- The host ---------------------------------------------------------------------------
-# The fork's desktop host as it is (the list of mcla-recomp's CMakeLists.txt),
-# plus what only iOS needs.
-set(MCLA_HOST_NAMES
-    main mcla_app aspect_ratio crash_trace audio_fallback audio_mixer fma_fast
-    frame_timing render_perf perf_options poll_wait warp_fix button_prompts
-    settings_menu pad_probe save_wait display_gamma render_markers
-    vehicle_telemetry vibration stick_deadzone checkpoint_sweep pc_triggers
-    sampling_profiler code_pointer_scan shader_prepare shader_storage_files
-    dev_pad)
+# The fork's host, exactly the sources its own CMakeLists.txt builds (read from
+# it, so a new release's new files come along), plus what only iOS needs.
+file(READ "${MCLA_FORK_DIR}/CMakeLists.txt" _mcla_fork_cmake)
+# The block runs from "set(MCLA_SOURCES" to the first line that is only ")"
+# (its comments have parentheses of their own).
+string(FIND "${_mcla_fork_cmake}" "set(MCLA_SOURCES" _mcla_begin)
+if(_mcla_begin LESS 0)
+    message(FATAL_ERROR "No set(MCLA_SOURCES ...) in ${MCLA_FORK_DIR}/CMakeLists.txt")
+endif()
+string(SUBSTRING "${_mcla_fork_cmake}" ${_mcla_begin} -1 _mcla_sources_block)
+string(FIND "${_mcla_sources_block}" "\n)" _mcla_end)
+string(SUBSTRING "${_mcla_sources_block}" 0 ${_mcla_end} _mcla_sources_block)
+string(REGEX MATCHALL "src/[A-Za-z0-9_]+[.]cpp" _mcla_host_relative "${_mcla_sources_block}")
 set(MCLA_HOST_SOURCES)
-foreach(_name IN LISTS MCLA_HOST_NAMES)
-    list(APPEND MCLA_HOST_SOURCES "${MCLA_FORK_DIR}/src/${_name}.cpp")
+foreach(_rel IN LISTS _mcla_host_relative)
+    list(APPEND MCLA_HOST_SOURCES "${MCLA_FORK_DIR}/${_rel}")
 endforeach()
+list(LENGTH MCLA_HOST_SOURCES _mcla_host_count)
+message(STATUS "mcla host: ${_mcla_host_count} sources from the fork")
+
+# The save sync (sync/mclasync.go, built as a C archive by the workflow).
+set(MCLA_SYNC_LIB "" CACHE FILEPATH "libmclasync.a (empty: no save sync)")
 
 add_executable(mcla MACOSX_BUNDLE
     ${MCLA_HOST_SOURCES}
-    ios_support.mm)
+    ios_support.mm
+    ios_sync.mm)
 target_include_directories(mcla PRIVATE
     "${MCLA_FORK_DIR}"
     "${MCLA_FORK_DIR}/src"
@@ -99,7 +109,19 @@ target_include_directories(mcla PRIVATE
     "${CMAKE_CURRENT_BINARY_DIR}/include")
 target_include_directories(mcla SYSTEM PRIVATE ${MCLA_SDK_THIRDPARTY_INCLUDES})
 target_compile_options(mcla PRIVATE -fno-strict-aliasing -fno-char8_t -ffp-contract=off)
-set_source_files_properties(ios_support.mm PROPERTIES COMPILE_OPTIONS "-fobjc-arc")
+set_source_files_properties(ios_support.mm ios_sync.mm PROPERTIES COMPILE_OPTIONS "-fobjc-arc")
+if(MCLA_SYNC_LIB)
+    get_filename_component(_mcla_sync_dir "${MCLA_SYNC_LIB}" DIRECTORY)
+    target_compile_definitions(mcla PRIVATE MCLA_HAVE_SYNC=1)
+    target_include_directories(mcla PRIVATE "${_mcla_sync_dir}")
+    # The Go runtime's own needs: the system's TLS roots (Security), name
+    # resolution (resolv).
+    target_link_libraries(mcla PRIVATE "${MCLA_SYNC_LIB}"
+        "-framework Security" "-framework CoreFoundation" "-framework SystemConfiguration" resolv)
+    message(STATUS "mcla: save sync from ${MCLA_SYNC_LIB}")
+else()
+    message(STATUS "mcla: no save sync")
+endif()
 
 # Every object of the runtime and the GPU: both register things (kernel
 # exports, settings) from static constructors, which a linker taking only the

@@ -349,10 +349,10 @@ index bb00582..0425471 100644
    loader_candidates.emplace_back("libvulkan.dylib");
    loader_candidates.emplace_back("libMoltenVK.dylib");
 diff --git a/src/ui/windowed_app_main_sdl.cpp b/src/ui/windowed_app_main_sdl.cpp
-index 77bb1dc..331d78c 100644
+index 77bb1dc..0c6b368 100644
 --- a/src/ui/windowed_app_main_sdl.cpp
 +++ b/src/ui/windowed_app_main_sdl.cpp
-@@ -22,6 +22,12 @@
+@@ -22,6 +22,16 @@
  #include <rex/ui/windowed_app.h>
  #include <rex/ui/windowed_app_context_sdl.h>
  
@@ -360,11 +360,27 @@ index 77bb1dc..331d78c 100644
 +// UIKit owns the process's entry point: SDL's main() starts UIApplicationMain
 +// and calls the main() below (renamed SDL_main) once the app has launched.
 +#include <SDL3/SDL_main.h>
++
++// The app's own setup, once UIKit has started and before the runtime does
++// (the game's save sync). Defined by the app when it has one.
++extern "C" void rex_ios_before_app(void) __attribute__((weak));
 +#endif
 +
  #if REX_PLATFORM_WIN32
  #ifndef WIN32_LEAN_AND_MEAN
  #define WIN32_LEAN_AND_MEAN
+@@ -127,6 +137,11 @@ int WINAPI wWinMain(HINSTANCE hinstance, HINSTANCE hinstance_prev, LPWSTR comman
+ #else
+ 
+ int main(int argc, char* argv[]) {
++#if REX_PLATFORM_IOS
++  if (rex_ios_before_app) {
++    rex_ios_before_app();
++  }
++#endif
+   return RunWindowedApp(argc, argv);
+ }
+ 
 diff --git a/thirdparty/CMakeLists.txt b/thirdparty/CMakeLists.txt
 index f102b56..72dde36 100644
 --- a/thirdparty/CMakeLists.txt

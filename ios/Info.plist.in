@@ -75,6 +75,9 @@
     </array>
     <key>CADisableMinimumFrameDurationOnPhone</key>
     <true/>
+    <!-- The save sync talks to the PC and the Steam Deck on the home network. -->
+    <key>NSLocalNetworkUsageDescription</key>
+    <string>MCLA syncs your career save with your PC and Steam Deck over the local network.</string>
     <key>ITSAppUsesNonExemptEncryption</key>
     <false/>
 </dict>
