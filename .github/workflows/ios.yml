@@ -1,0 +1,174 @@
+name: iOS
+
+# Builds the iOS app on a macOS runner.
+#
+# This repository holds no game code. The recompiled code (generated on a PC
+# from the owner's own disc image) comes in as an encrypted archive from a
+# branch of a private repository, and the IPA, which contains that code
+# compiled, goes back the same way. Nothing derived from the game is uploaded
+# as an artifact, cached, or printed: the game code is compiled with -w and
+# its compile output is kept out of the log.
+#
+# Secrets:
+#   MCLA_PRIVATE_REPO   owner/name of the private repository
+#   MCLA_DEPLOY_KEY     private half of a deploy key (write) of that repository only
+#   MCLA_PASSPHRASE     the passphrase of the archives (tools/pack_generated.py)
+
+on:
+  workflow_dispatch:
+    inputs:
+      generated_tag:
+        description: Branch of the private repository that holds generated.tar.zst.enc
+        default: generated
+      sdk_only:
+        description: Build the runtime only (no game code needed)
+        type: boolean
+        default: false
+
+permissions:
+  contents: read
+
+env:
+  SDK_ASSET: rexglue-sdk-source-f5337cdc-7bb14d86c7e0.tar.xz
+  SDK_SHA256: f97856b3afee5ff23114b43b6dbaa3f44d9ea8b26121f3b63b25ed9a4ed844eb
+  SDK_RELEASE: https://github.com/RenanQueiroz/mcla-recomp/releases/download/v0.3.12
+  MOLTENVK_URL: https://github.com/KhronosGroup/MoltenVK/releases/download/v1.4.2/MoltenVK-ios.tar
+  DEPLOYMENT_TARGET: "17.0"
+
+jobs:
+  build:
+    runs-on: macos-15
+    timeout-minutes: 300
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Tools
+        run: |
+          brew install ninja zstd
+          xcodebuild -version
+          clang --version
+          cmake --version
+          sysctl -n hw.ncpu hw.memsize
+
+      - name: SDK source (ReXGlue f5337cdc with the fork's patches)
+        run: |
+          curl -fL --retry 5 -o "$SDK_ASSET" "$SDK_RELEASE/$SDK_ASSET"
+          echo "$SDK_SHA256  $SDK_ASSET" | shasum -a 256 -c -
+          mkdir src-archive
+          tar -xJf "$SDK_ASSET" -C src-archive --strip-components=1
+          rm "$SDK_ASSET"
+          cd src-archive/sdk
+          # The archive has no .git folders; the SDK's CMake takes one in each
+          # third-party folder as the sign that the submodule is there.
+          for dir in thirdparty/*/; do [ -e "$dir.git" ] || touch "$dir.git"; done
+          for patch in "$GITHUB_WORKSPACE"/patches/*.patch; do
+            echo "applying $(basename "$patch")"
+            patch -p1 --no-backup-if-mismatch < "$patch"
+          done
+
+      - name: MoltenVK
+        run: |
+          curl -fL --retry 5 -o MoltenVK-ios.tar "$MOLTENVK_URL"
+          mkdir moltenvk && tar -xf MoltenVK-ios.tar -C moltenvk
+          find moltenvk -maxdepth 6 -name 'MoltenVK.framework' -o -maxdepth 6 -name '*.xcframework'
+
+      - name: Private repository (deploy key)
+        if: ${{ !inputs.sdk_only }}
+        env:
+          MCLA_DEPLOY_KEY: ${{ secrets.MCLA_DEPLOY_KEY }}
+          MCLA_PRIVATE_REPO: ${{ secrets.MCLA_PRIVATE_REPO }}
+        run: |
+          mkdir -p ~/.ssh private
+          echo "$MCLA_DEPLOY_KEY" > ~/.ssh/mcla_deploy
+          chmod 600 ~/.ssh/mcla_deploy
+          ssh-keyscan -t ed25519,rsa github.com >> ~/.ssh/known_hosts 2>/dev/null
+          echo "GIT_SSH_COMMAND=ssh -i $HOME/.ssh/mcla_deploy -o IdentitiesOnly=yes" >> "$GITHUB_ENV"
+          export GIT_SSH_COMMAND="ssh -i $HOME/.ssh/mcla_deploy -o IdentitiesOnly=yes"
+          git clone --quiet --depth 1 --branch "${{ inputs.generated_tag }}" "git@github.com:$MCLA_PRIVATE_REPO.git" private/repo
+
+      - name: Generated game code
+        if: ${{ !inputs.sdk_only }}
+        env:
+          MCLA_PASSPHRASE: ${{ secrets.MCLA_PASSPHRASE }}
+        run: |
+          mkdir -p private/generated
+          openssl enc -d -aes-256-cbc -pbkdf2 -iter 200000 -pass env:MCLA_PASSPHRASE -in private/repo/generated.tar.zst.enc | zstd -d | tar -xf - -C private/generated
+          ls private/generated | wc -l
+
+      - name: Stand-in for the game code (runtime only)
+        if: ${{ inputs.sdk_only }}
+        run: |
+          # Enough for CMake to configure; only the runtime's targets are built.
+          mkdir -p private/generated
+          printf 'set(GENERATED_SOURCES ${CMAKE_CURRENT_LIST_DIR}/empty.cpp)\n' > private/generated/sources.cmake
+          : > private/generated/empty.cpp
+          : > private/generated/mcla_pch.h
+
+      - name: Configure
+        run: |
+          cmake -G Ninja -S ios -B build \
+            -DCMAKE_SYSTEM_NAME=iOS \
+            -DCMAKE_OSX_ARCHITECTURES=arm64 \
+            -DCMAKE_OSX_DEPLOYMENT_TARGET="$DEPLOYMENT_TARGET" \
+            -DCMAKE_BUILD_TYPE=Release \
+            -DCMAKE_XCODE_ATTRIBUTE_CODE_SIGNING_ALLOWED=NO \
+            -DCMAKE_TRY_COMPILE_TARGET_TYPE=STATIC_LIBRARY \
+            -DREXSDK_DIR="$PWD/src-archive/sdk" \
+            -DMCLA_FORK_DIR="$PWD/src-archive/fork" \
+            -DMCLA_GENERATED_DIR="$PWD/private/generated" \
+            -DMCLA_BUNDLE_VERSION="${{ github.run_number }}"
+
+      - name: Build the runtime
+        run: cmake --build build --target rexruntime rexgpu-xenos
+
+      - name: Build the game
+        if: ${{ !inputs.sdk_only }}
+        run: |
+          # The game code's compile output stays out of the public log: on a
+          # failure, only the names of what failed and the messages' first
+          # lines (file, line, message; no source text) are shown.
+          if ! cmake --build build --target mcla > private/game-build.log 2>&1; then
+            echo "::error::the game's build failed"
+            grep -E '^FAILED:|error:|ld: |Undefined symbols|"_.*", referenced from' private/game-build.log \
+              | grep -v -E '^\s+[0-9]+ \|' | cut -c1-400 | head -200
+            exit 1
+          fi
+          tail -3 private/game-build.log
+
+      - name: Package
+        if: ${{ !inputs.sdk_only }}
+        run: |
+          app=build/mcla.app
+          test -f "$app/mcla"
+          framework=$(find moltenvk -path '*ios-arm64/MoltenVK.framework' -type d | head -1)
+          test -n "$framework" || { echo "no dynamic MoltenVK.framework for ios-arm64 in the release"; find moltenvk -maxdepth 7; exit 1; }
+          mkdir -p "$app/Frameworks"
+          cp -R "$framework" "$app/Frameworks/"
+          cp src-archive/fork/LICENSE "$app/LICENSE.txt"
+          cp src-archive/fork/THIRD-PARTY-NOTICES.md "$app/THIRD-PARTY-NOTICES.md"
+          if [ -d src-archive/fork/shaderpack ]; then cp -R src-archive/fork/shaderpack "$app/shaderpack"; fi
+          strip -x "$app/mcla"
+          codesign --force --sign - "$app/Frameworks/MoltenVK.framework"
+          codesign --force --sign - --entitlements ios/mcla.entitlements "$app"
+          lipo -info "$app/mcla"; otool -L "$app/mcla"; du -sh "$app"
+          mkdir -p private/Payload && mv "$app" private/Payload/
+          (cd private && zip -qry mcla.ipa Payload && shasum -a 256 mcla.ipa)
+
+      - name: Hand the IPA to the private repository
+        if: ${{ !inputs.sdk_only }}
+        env:
+          MCLA_PRIVATE_REPO: ${{ secrets.MCLA_PRIVATE_REPO }}
+          MCLA_PASSPHRASE: ${{ secrets.MCLA_PASSPHRASE }}
+        run: |
+          branch="build-${{ github.run_number }}"
+          mkdir private/out && cd private/out
+          openssl enc -aes-256-cbc -pbkdf2 -iter 200000 -pass env:MCLA_PASSPHRASE -in ../mcla.ipa -out mcla.ipa.enc
+          shasum -a 256 mcla.ipa.enc > SHA256SUMS
+          # Under GitHub's 100 MB a file: in pieces, joined again with cat.
+          split -b 90m mcla.ipa.enc mcla.ipa.enc.part- && rm mcla.ipa.enc
+          echo "iOS build ${{ github.run_number }} of ${{ github.sha }}" > BUILD.txt
+          git init -q -b "$branch" .
+          git add -A
+          git -c user.name=mcla-ios-build -c user.email=build@localhost commit -q -m "$branch"
+          git push -q "git@github.com:$MCLA_PRIVATE_REPO.git" "$branch"
+          echo "pushed as branch $branch"

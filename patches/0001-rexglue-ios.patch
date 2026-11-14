@@ -1,0 +1,388 @@
+diff --git a/CMakeLists.txt b/CMakeLists.txt
+index 887eaf5..ed55cd9 100644
+--- a/CMakeLists.txt
++++ b/CMakeLists.txt
+@@ -186,6 +186,11 @@ elseif(UNIX AND NOT APPLE)
+         set(REX_PLATFORM "linux-${REX_TARGET_PROCESSOR}")
+     endif()
+     add_compile_definitions(REX_PLATFORM_LINUX=1)
++elseif(IOS)
++    # iPhone and iPad: the macOS code paths, linked statically into one app
++    # executable (an app cannot load code that is not in its signed bundle).
++    set(REX_PLATFORM "ios-arm64")
++    add_compile_definitions(REX_PLATFORM_MAC=1)
+ elseif(APPLE)
+     if(REX_TARGET_PROCESSOR MATCHES "AMD64|x86_64")
+         set(REX_PLATFORM "mac-amd64")
+@@ -281,8 +286,11 @@ add_subdirectory(src/audio)
+ add_subdirectory(src/graphics)
+ add_subdirectory(src/system)
+ add_subdirectory(src/kernel)
+-add_subdirectory(src/codegen)
+-add_subdirectory(src/rexglue)
++# The recompiler is a host tool; an iOS build takes the code it generated.
++if(NOT IOS)
++    add_subdirectory(src/codegen)
++    add_subdirectory(src/rexglue)
++endif()
+ 
+ # Add tests subdirectory if tests are enabled
+ if(REXGLUE_BUILD_TESTS)
+@@ -317,7 +325,7 @@ if(PROJECT_IS_TOP_LEVEL)
+     include(cmake/rexglue_devenv.cmake)
+     # The install/export rules package the SDK for desktop consumers. A PS5
+     # build links everything statically into one title and is not installed.
+-    if(NOT PS5)
++    if(NOT PS5 AND NOT IOS)
+         include(cmake/rexglue_install.cmake)
+     endif()
+ else()
+diff --git a/cmake/rexglue_helpers.cmake b/cmake/rexglue_helpers.cmake
+index f455b00..3739faa 100644
+--- a/cmake/rexglue_helpers.cmake
++++ b/cmake/rexglue_helpers.cmake
+@@ -89,6 +89,12 @@ function(rexglue_configure_target target_name)
+             INSTALL_RPATH "$ORIGIN"
+             BUILD_WITH_INSTALL_RPATH ON
+         )
++    elseif(IOS)
++        # Everything but MoltenVK is static; that one is a framework.
++        set_target_properties(${target_name} PROPERTIES
++            INSTALL_RPATH "@executable_path/Frameworks"
++            BUILD_WITH_INSTALL_RPATH ON
++        )
+     elseif(APPLE)
+         # macOS analogue of $ORIGIN: resolve @rpath dylibs (librexruntime,
+         # libTracyClient, ...) next to the executable. Pairs with the runtime
+@@ -115,7 +121,7 @@ function(rexglue_configure_target target_name)
+             COMMAND_EXPAND_LISTS
+             VERBATIM
+         )
+-    elseif(APPLE)
++    elseif(APPLE AND NOT IOS)
+         # macOS: $<TARGET_RUNTIME_DLLS> does not resolve imported dylibs, so
+         # stage the shared runtime libraries explicitly next to the executable
+         # (paired with the @executable_path rpath above). Everything else the
+@@ -163,16 +169,21 @@ function(rexglue_configure_target target_name)
+                 "rexglue_configure_target: unknown GPU plugin '${_plugin}' "
+                 "(no target rexgpu-${_plugin} or rex::gpu-${_plugin})")
+         endif()
+-        add_custom_command(TARGET ${target_name} POST_BUILD
+-            COMMAND ${CMAKE_COMMAND} -E copy_if_different
+-                $<TARGET_FILE:${_plugin_target}>
+-                $<TARGET_FILE_DIR:${target_name}>
+-            VERBATIM
+-        )
++        if(IOS)
++            # Linked in, not loaded: gpu_plugin_loader.cpp calls its factory.
++            target_link_libraries(${target_name} PRIVATE ${_plugin_target})
++        else()
++            add_custom_command(TARGET ${target_name} POST_BUILD
++                COMMAND ${CMAKE_COMMAND} -E copy_if_different
++                    $<TARGET_FILE:${_plugin_target}>
++                    $<TARGET_FILE_DIR:${target_name}>
++                VERBATIM
++            )
++        endif()
+         unset(_plugin_target)
+     endforeach()
+ 
+-    if(APPLE AND REXGLUE_USE_VULKAN)
++    if(APPLE AND NOT IOS AND REXGLUE_USE_VULKAN)
+         _rexglue_stage_macos_vulkan_runtime(${target_name})
+     endif()
+ endfunction()
+diff --git a/include/rex/platform.h b/include/rex/platform.h
+index 5f0afef..bb6b8d8 100644
+--- a/include/rex/platform.h
++++ b/include/rex/platform.h
+@@ -29,7 +29,13 @@
+ #endif
+ 
+ #if defined(TARGET_OS_MAC) && TARGET_OS_MAC
++// TARGET_OS_MAC is 1 on every Darwin target, iOS included: iOS takes the
++// macOS paths (Mach, MoltenVK, 16 KiB pages) and REX_PLATFORM_IOS marks where
++// it differs (no shm_open, no mach_vm.h, no loadable plugins, sandboxed paths).
+ #define REX_PLATFORM_MAC 1
++#if defined(TARGET_OS_IPHONE) && TARGET_OS_IPHONE
++#define REX_PLATFORM_IOS 1
++#endif
+ #elif defined(WIN32) || defined(_WIN32)
+ #define REX_PLATFORM_WIN32 1
+ #elif defined(__ANDROID__)
+@@ -53,6 +59,9 @@
+ #ifndef REX_PLATFORM_MAC
+ #define REX_PLATFORM_MAC 0
+ #endif
++#ifndef REX_PLATFORM_IOS
++#define REX_PLATFORM_IOS 0
++#endif
+ #ifndef REX_PLATFORM_WIN32
+ #define REX_PLATFORM_WIN32 0
+ #endif
+diff --git a/src/core/filesystem_posix.cpp b/src/core/filesystem_posix.cpp
+index d3de48a..145b0b5 100644
+--- a/src/core/filesystem_posix.cpp
++++ b/src/core/filesystem_posix.cpp
+@@ -100,10 +100,28 @@ std::filesystem::path GetExecutablePath() {
+ }
+ 
+ std::filesystem::path GetExecutableFolder() {
++#if REX_PLATFORM_IOS
++  // The app bundle is read-only and signed. Everything the desktop builds keep
++  // beside the executable (the settings file, the game folder, the shader
++  // pack, logs) lives in the app's Documents folder, which the Files app and a
++  // computer can read and write. GetExecutablePath() still names the bundle.
++  if (auto home = rex::platform::env::get("HOME")) {
++    std::filesystem::path documents = std::filesystem::path(*home) / "Documents";
++    std::error_code ec;
++    std::filesystem::create_directories(documents, ec);
++    return documents;
++  }
++#endif
+   return GetExecutablePath().parent_path();
+ }
+ 
+ std::filesystem::path GetUserFolder() {
++#if REX_PLATFORM_IOS
++  // Saves and the shader cache: Library/Application Support in the container.
++  if (auto home = rex::platform::env::get("HOME")) {
++    return std::filesystem::path(*home) / "Library" / "Application Support";
++  }
++#endif
+   // get preferred data home
+   if (auto xdg = rex::platform::env::get("XDG_DATA_HOME")) {
+     return std::filesystem::path(*xdg);
+diff --git a/src/core/memory_posix.cpp b/src/core/memory_posix.cpp
+index 87734e2..2acea45 100644
+--- a/src/core/memory_posix.cpp
++++ b/src/core/memory_posix.cpp
+@@ -22,7 +22,16 @@
+ 
+ #if REX_PLATFORM_MAC
+ #include <mach/mach.h>
++#if REX_PLATFORM_IOS
++// The iOS SDK's mach_vm.h is an #error. vm_map.h's calls take vm_address_t,
++// which is 64 bits wide on arm64, so they do the same work here.
++#include <mach/vm_map.h>
++#define mach_vm_address_t vm_address_t
++#define mach_vm_size_t vm_size_t
++#define mach_vm_region vm_region_64
++#else
+ #include <mach/mach_vm.h>
++#endif
+ #include <mach/vm_region.h>
+ #endif  // REX_PLATFORM_MAC
+ 
+@@ -501,6 +510,23 @@ FileMappingHandle CreateFileMappingHandle(const std::filesystem::path& path, siz
+     return kFileMappingHandleInvalid;
+   }
+   return static_cast<FileMappingHandle>(ashmem_fd);
++#elif REX_PLATFORM_IOS
++  // An app's sandbox refuses shm_open (EPERM). A named Mach memory entry is
++  // the same thing without a name: anonymous memory that can be mapped at any
++  // number of addresses. The handle is the entry's port.
++  (void)path;
++  (void)access;
++  (void)commit;
++  memory_object_size_t entry_size = rex::round_up(length, page_size());
++  mach_port_t entry = MACH_PORT_NULL;
++  const kern_return_t kr = mach_make_memory_entry_64(
++      mach_task_self(), &entry_size, 0, MAP_MEM_NAMED_CREATE | VM_PROT_READ | VM_PROT_WRITE,
++      &entry, MACH_PORT_NULL);
++  if (kr != KERN_SUCCESS || entry == MACH_PORT_NULL) {
++    REXSYS_ERROR("mach_make_memory_entry_64(0x{:X}) failed: {}", length, static_cast<int>(kr));
++    return kFileMappingHandleInvalid;
++  }
++  return static_cast<FileMappingHandle>(entry);
+ #else
+   int oflag;
+   switch (access) {
+@@ -581,6 +607,11 @@ void CloseFileMappingHandle(FileMappingHandle handle, const std::filesystem::pat
+     }
+     return;
+   }
++#endif
++#if REX_PLATFORM_IOS
++  (void)path;
++  mach_port_deallocate(mach_task_self(), static_cast<mach_port_t>(handle));
++  return;
+ #endif
+   close(static_cast<int>(handle));
+ #if !REX_PLATFORM_ANDROID && !REX_PLATFORM_PS5
+@@ -607,6 +638,24 @@ void* MapFileView(FileMappingHandle handle, void* base_address, size_t length, P
+   }
+ 
+   uint32_t prot = ToPosixProtectFlags(access);
++#if REX_PLATFORM_IOS
++  {
++    // PROT_READ/WRITE have VM_PROT_READ/WRITE's values. Guest memory is never
++    // executable, and iOS would refuse it.
++    const vm_prot_t vm_prot = static_cast<vm_prot_t>(prot) & (VM_PROT_READ | VM_PROT_WRITE);
++    vm_address_t address = reinterpret_cast<vm_address_t>(base_address);
++    const int vm_flags = base_address ? (VM_FLAGS_FIXED | VM_FLAGS_OVERWRITE) : VM_FLAGS_ANYWHERE;
++    const kern_return_t kr =
++        vm_map(mach_task_self(), &address, length, 0, vm_flags, static_cast<mach_port_t>(handle),
++               file_offset, FALSE, vm_prot, VM_PROT_READ | VM_PROT_WRITE, VM_INHERIT_NONE);
++    if (kr != KERN_SUCCESS) {
++      REXSYS_ERROR("vm_map(0x{:X} bytes at {}, offset 0x{:X}) failed: {}", length, base_address,
++                   file_offset, static_cast<int>(kr));
++      return nullptr;
++    }
++    return reinterpret_cast<void*>(address);
++  }
++#endif
+ #if REX_PLATFORM_PS5
+   if (handle == kDirectMemoryHandle) {
+     if (g_direct_start < 0 || file_offset + length > g_direct_length) {
+diff --git a/src/graphics/CMakeLists.txt b/src/graphics/CMakeLists.txt
+index a910d57..660ae53 100644
+--- a/src/graphics/CMakeLists.txt
++++ b/src/graphics/CMakeLists.txt
+@@ -102,7 +102,7 @@ if(REXGLUE_USE_D3D12)
+ endif()
+ 
+ # On PS5 the GPU implementation is linked in, not loaded as a plugin.
+-if(PS5)
++if(PS5 OR IOS)
+     add_library(rexgpu-xenos STATIC ${REXGPU_XENOS_SOURCES})
+ else()
+     add_library(rexgpu-xenos SHARED ${REXGPU_XENOS_SOURCES})
+diff --git a/src/system/CMakeLists.txt b/src/system/CMakeLists.txt
+index 6231b65..da8c4de 100644
+--- a/src/system/CMakeLists.txt
++++ b/src/system/CMakeLists.txt
+@@ -50,7 +50,7 @@ set(REXSYSTEM_SOURCES
+ 
+ # PS5 titles are one static executable; there is nothing to load a shared
+ # runtime from.
+-if(PS5)
++if(PS5 OR IOS)
+     add_library(rexruntime STATIC ${REXSYSTEM_SOURCES})
+ else()
+     add_library(rexruntime SHARED ${REXSYSTEM_SOURCES})
+diff --git a/src/system/gpu_plugin_loader.cpp b/src/system/gpu_plugin_loader.cpp
+index 754fa13..c98d50f 100644
+--- a/src/system/gpu_plugin_loader.cpp
++++ b/src/system/gpu_plugin_loader.cpp
+@@ -22,6 +22,13 @@
+ #include <rex/platform.h>
+ #include <rex/platform/dynlib.h>
+ 
++#if REX_PLATFORM_IOS
++// The GPU implementation is linked into the app (an iOS app loads no code
++// from outside its signed bundle, and one executable signs simplest).
++extern "C" rex::system::IGraphicsSystem* rex_gpu_create(uint32_t abi_version,
++                                                        const rex::system::GpuCreateInfo* info);
++#endif
++
+ namespace rex::system {
+ 
+ namespace {
+@@ -55,6 +62,19 @@ std::vector<platform::DynamicLibrary>& LoadedPlugins() {
+ }  // namespace
+ 
+ std::unique_ptr<IGraphicsSystem> LoadGpuPlugin(std::string_view name, std::string_view backend) {
++#if REX_PLATFORM_IOS
++  std::string static_backend(backend);
++  GpuCreateInfo static_info{};
++  static_info.struct_size = sizeof(GpuCreateInfo);
++  static_info.backend = static_backend.c_str();
++  IGraphicsSystem* static_graphics_system = ::rex_gpu_create(kGpuPluginAbiVersion, &static_info);
++  if (!static_graphics_system) {
++    REXSYS_ERROR("Linked GPU '{}' returned no graphics system (backend '{}')", name,
++                 static_backend);
++    return nullptr;
++  }
++  return std::unique_ptr<IGraphicsSystem>(static_graphics_system);
++#else
+   auto path = rex::filesystem::GetExecutableFolder() / PluginFileName(name);
+   if (!std::filesystem::exists(path)) {
+     REXSYS_ERROR(
+@@ -100,6 +120,7 @@ std::unique_ptr<IGraphicsSystem> LoadGpuPlugin(std::string_view name, std::strin
+   LoadedPlugins().push_back(std::move(library));
+   REXSYS_DEBUG("GPU plugin '{}' loaded ({})", name, path.filename().string());
+   return std::unique_ptr<IGraphicsSystem>(graphics_system);
++#endif  // REX_PLATFORM_IOS
+ }
+ 
+ }  // namespace rex::system
+diff --git a/src/system/xmemory.cpp b/src/system/xmemory.cpp
+index 0de733a..34d42bf 100644
+--- a/src/system/xmemory.cpp
++++ b/src/system/xmemory.cpp
+@@ -359,7 +359,8 @@ int Memory::MapViewsMac() {
+                                            map_info[n].virtual_address_start + 1);
+     size_t file_offset = static_cast<size_t>(map_info[n].target_address & granularity_mask);
+     void* target_address = mapping_base + map_info[n].virtual_address_start;
+-#if REX_PLATFORM_PS5
++#if REX_PLATFORM_PS5 || REX_PLATFORM_IOS
++    // iOS: the mapping is a Mach memory entry, not a descriptor mmap takes.
+     void* result = rex::memory::MapFileView(mapping_, target_address, view_size,
+                                             rex::memory::PageAccess::kReadWrite, file_offset);
+     if (!result) {
+diff --git a/src/ui/vulkan/vulkan_instance.cpp b/src/ui/vulkan/vulkan_instance.cpp
+index bb00582..0425471 100644
+--- a/src/ui/vulkan/vulkan_instance.cpp
++++ b/src/ui/vulkan/vulkan_instance.cpp
+@@ -16,6 +16,7 @@
+ #include <vector>
+ 
+ #include <rex/cvar.h>
++#include <rex/filesystem.h>
+ #include <rex/logging.h>
+ #include <rex/platform.h>
+ #include <rex/ui/vulkan/instance.h>
+@@ -59,6 +60,12 @@ std::unique_ptr<VulkanInstance> VulkanInstance::Create(const bool with_surface,
+   ConfigureMacOSVulkanEnvironment(macos_runtime_paths);
+ 
+   std::vector<std::filesystem::path> loader_candidates = macos_runtime_paths.loader_candidates;
++#if REX_PLATFORM_IOS
++  // No loader and no ICD manifest on iOS: MoltenVK itself, from the app bundle.
++  loader_candidates.insert(loader_candidates.begin(),
++                           rex::filesystem::GetExecutablePath().parent_path() / "Frameworks" /
++                               "MoltenVK.framework" / "MoltenVK");
++#endif
+   loader_candidates.emplace_back(platform::lib_names::kVulkanLoader);
+   loader_candidates.emplace_back("libvulkan.dylib");
+   loader_candidates.emplace_back("libMoltenVK.dylib");
+diff --git a/src/ui/windowed_app_main_sdl.cpp b/src/ui/windowed_app_main_sdl.cpp
+index 77bb1dc..331d78c 100644
+--- a/src/ui/windowed_app_main_sdl.cpp
++++ b/src/ui/windowed_app_main_sdl.cpp
+@@ -22,6 +22,12 @@
+ #include <rex/ui/windowed_app.h>
+ #include <rex/ui/windowed_app_context_sdl.h>
+ 
++#if REX_PLATFORM_IOS
++// UIKit owns the process's entry point: SDL's main() starts UIApplicationMain
++// and calls the main() below (renamed SDL_main) once the app has launched.
++#include <SDL3/SDL_main.h>
++#endif
++
+ #if REX_PLATFORM_WIN32
+ #ifndef WIN32_LEAN_AND_MEAN
+ #define WIN32_LEAN_AND_MEAN
+diff --git a/thirdparty/CMakeLists.txt b/thirdparty/CMakeLists.txt
+index f102b56..72dde36 100644
+--- a/thirdparty/CMakeLists.txt
++++ b/thirdparty/CMakeLists.txt
+@@ -49,7 +49,7 @@ if(REXGLUE_USE_VULKAN)
+         vulkan-headers vulkan-memory-allocator
+         spirv-headers spirv-tools glslang
+     )
+-    if(APPLE)
++    if(APPLE AND NOT IOS)
+         list(APPEND REQUIRED_SUBMODULES vulkan-loader moltenvk)
+     endif()
+ endif()
+@@ -201,7 +201,8 @@ if(REXGLUE_USE_VULKAN)
+     set(VMA_ENABLE_INSTALL ON CACHE BOOL "" FORCE)
+     add_subdirectory(vulkan-memory-allocator)
+ 
+-    if(APPLE)
++    # iOS: the app bundle carries Khronos' MoltenVK.framework, loaded directly.
++    if(APPLE AND NOT IOS)
+         # Build the loader and MoltenVK revisions shipped by the pinned SDK.
+         # They remain runtime-loaded; no Vulkan implementation is linked into
+         # rexglue itself.

@@ -1,0 +1,15 @@
+# Nothing derived from the game, and nothing secret, is ever committed.
+third_party/
+private/
+out/
+build/
+signing/
+*.ipa
+*.enc
+*.xex
+*.rpf
+*.iso
+*.mobileprovision
+*.p12
+passphrase*.txt
+__pycache__/
