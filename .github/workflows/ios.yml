@@ -61,6 +61,10 @@ jobs:
           # The archive has no .git folders; the SDK's CMake takes one in each
           # third-party folder as the sign that the submodule is there.
           for dir in thirdparty/*/; do [ -e "$dir.git" ] || touch "$dir.git"; done
+          # Nor symbolic links: libmspack's cabextract/mspack is one, to its
+          # own mspack folder, and the SDK's CMake names lzxd.c through it.
+          [ -e thirdparty/libmspack/cabextract/mspack ] || ln -s ../libmspack/mspack thirdparty/libmspack/cabextract/mspack
+          test -f thirdparty/libmspack/cabextract/mspack/lzxd.c
           for patch in "$GITHUB_WORKSPACE"/patches/*.patch; do
             echo "applying $(basename "$patch")"
             patch -p1 --no-backup-if-mismatch < "$patch"
