@@ -1,8 +1,8 @@
 diff --git a/CMakeLists.txt b/CMakeLists.txt
-index 887eaf5..ed55cd9 100644
+index 887eaf5..017578a 100644
 --- a/CMakeLists.txt
 +++ b/CMakeLists.txt
-@@ -186,6 +186,11 @@ elseif(UNIX AND NOT APPLE)
+@@ -186,6 +186,13 @@ elseif(UNIX AND NOT APPLE)
          set(REX_PLATFORM "linux-${REX_TARGET_PROCESSOR}")
      endif()
      add_compile_definitions(REX_PLATFORM_LINUX=1)
@@ -10,11 +10,13 @@ index 887eaf5..ed55cd9 100644
 +    # iPhone and iPad: the macOS code paths, linked statically into one app
 +    # executable (an app cannot load code that is not in its signed bundle).
 +    set(REX_PLATFORM "ios-arm64")
-+    add_compile_definitions(REX_PLATFORM_MAC=1)
++    # Both on the command line, as REX_PLATFORM_MAC is for macOS: some sources
++    # test them ahead of including rex/platform.h.
++    add_compile_definitions(REX_PLATFORM_MAC=1 REX_PLATFORM_IOS=1)
  elseif(APPLE)
      if(REX_TARGET_PROCESSOR MATCHES "AMD64|x86_64")
          set(REX_PLATFORM "mac-amd64")
-@@ -281,8 +286,11 @@ add_subdirectory(src/audio)
+@@ -281,8 +288,11 @@ add_subdirectory(src/audio)
  add_subdirectory(src/graphics)
  add_subdirectory(src/system)
  add_subdirectory(src/kernel)
@@ -28,7 +30,7 @@ index 887eaf5..ed55cd9 100644
  
  # Add tests subdirectory if tests are enabled
  if(REXGLUE_BUILD_TESTS)
-@@ -317,7 +325,7 @@ if(PROJECT_IS_TOP_LEVEL)
+@@ -317,7 +327,7 @@ if(PROJECT_IS_TOP_LEVEL)
      include(cmake/rexglue_devenv.cmake)
      # The install/export rules package the SDK for desktop consumers. A PS5
      # build links everything statically into one title and is not installed.

@@ -123,7 +123,9 @@ jobs:
             -DMCLA_BUNDLE_VERSION="${{ github.run_number }}"
 
       - name: Build the runtime
-        run: cmake --build build --target rexruntime rexgpu-xenos
+        run: |
+          # -k 0: every error of a run, not the first one only.
+          cmake --build build --target rexruntime rexgpu-xenos -- -k 0
 
       - name: Build the game
         if: ${{ !inputs.sdk_only }}
