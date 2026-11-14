@@ -122,6 +122,38 @@ index 5f0afef..bb6b8d8 100644
  #ifndef REX_PLATFORM_WIN32
  #define REX_PLATFORM_WIN32 0
  #endif
+diff --git a/include/rex/ui/app_background.h b/include/rex/ui/app_background.h
+new file mode 100644
+index 0000000..f14d1ba
+--- /dev/null
++++ b/include/rex/ui/app_background.h
+@@ -0,0 +1,26 @@
++/**
++ * @file        rex/ui/app_background.h
++ * @brief       Holding GPU work while an iOS app is in the background
++ *
++ * iOS refuses GPU work from an app in the background: a Metal command buffer
++ * committed then fails with kIOGPUCommandBufferCallbackErrorBackgroundExecution-
++ * NotPermitted, and Vulkan (MoltenVK) reports the device lost, which ends the
++ * game. The windowed app context closes this gate when the app is about to go
++ * to the background and opens it when the app is back; the threads that submit
++ * GPU work wait at it. The main (UI) thread never waits (it delivers the event
++ * that opens the gate); it does not paint while the gate is closed instead.
++ *
++ * On every other platform the gate is never closed.
++ */
++
++#pragma once
++
++namespace rex::ui {
++
++void SetAppInBackground(bool in_background);
++bool IsAppInBackground();
++// Blocks the calling thread while the app is in the background. Returns at
++// once on the main thread.
++void WaitWhileAppInBackground();
++
++}  // namespace rex::ui
 diff --git a/src/core/filesystem_posix.cpp b/src/core/filesystem_posix.cpp
 index d3de48a..145b0b5 100644
 --- a/src/core/filesystem_posix.cpp
@@ -323,6 +355,176 @@ index 0de733a..34d42bf 100644
      void* result = rex::memory::MapFileView(mapping_, target_address, view_size,
                                              rex::memory::PageAccess::kReadWrite, file_offset);
      if (!result) {
+diff --git a/src/ui/CMakeLists.txt b/src/ui/CMakeLists.txt
+index e1695f8..e7559f2 100644
+--- a/src/ui/CMakeLists.txt
++++ b/src/ui/CMakeLists.txt
+@@ -2,6 +2,7 @@
+ 
+ # Core UI sources
+ set(REXUI_CORE_SOURCES
++    app_background.cpp
+     graphics_upload_buffer_pool.cpp
+     graphics_util.cpp
+     image_decode.cpp
+diff --git a/src/ui/app_background.cpp b/src/ui/app_background.cpp
+new file mode 100644
+index 0000000..47a6da6
+--- /dev/null
++++ b/src/ui/app_background.cpp
+@@ -0,0 +1,51 @@
++/**
++ * @file        ui/app_background.cpp
++ * @brief       Holding GPU work while an iOS app is in the background
++ */
++
++#include <rex/ui/app_background.h>
++
++#include <atomic>
++#include <condition_variable>
++#include <mutex>
++
++#include <SDL3/SDL_init.h>
++
++#include <rex/logging.h>
++
++namespace rex::ui {
++
++namespace {
++std::atomic<bool> g_in_background{false};
++std::mutex g_mutex;
++std::condition_variable g_resumed;
++}  // namespace
++
++void SetAppInBackground(bool in_background) {
++  {
++    std::lock_guard<std::mutex> lock(g_mutex);
++    if (g_in_background.load(std::memory_order_relaxed) == in_background) {
++      return;
++    }
++    g_in_background.store(in_background, std::memory_order_release);
++  }
++  REXLOG_INFO("App {}: GPU work {}", in_background ? "going to the background" : "back",
++              in_background ? "held" : "resumed");
++  if (!in_background) {
++    g_resumed.notify_all();
++  }
++}
++
++bool IsAppInBackground() {
++  return g_in_background.load(std::memory_order_acquire);
++}
++
++void WaitWhileAppInBackground() {
++  if (!g_in_background.load(std::memory_order_acquire) || SDL_IsMainThread()) {
++    return;
++  }
++  std::unique_lock<std::mutex> lock(g_mutex);
++  g_resumed.wait(lock, [] { return !g_in_background.load(std::memory_order_acquire); });
++}
++
++}  // namespace rex::ui
+diff --git a/src/ui/presenter.cpp b/src/ui/presenter.cpp
+index 75d29b1..b01430a 100644
+--- a/src/ui/presenter.cpp
++++ b/src/ui/presenter.cpp
+@@ -26,6 +26,7 @@
+ #include <rex/logging.h>
+ #include <rex/platform.h>
+ #include <rex/ui/presenter.h>
++#include <rex/ui/app_background.h>
+ #include <rex/ui/window.h>
+ 
+ #if defined(REX_HAS_FIDELITYFX_RUNTIME) && REX_HAS_FIDELITYFX_RUNTIME
+@@ -647,6 +648,11 @@ void Presenter::OnSurfaceResizeFromUIThread() {
+ }
+ 
+ void Presenter::PaintFromUIThread(bool force_paint) {
++  // iOS: the app is (going) in the background, where GPU work is refused. The
++  // window is exposed again when the app is back, which paints.
++  if (IsAppInBackground()) {
++    return;
++  }
+   // If there is no surface, this will be a no-op, nothing outdated, nothing to
+   // paint. However, an explicit monitor check is needed because UI framerate
+   // limiting may be tied to signals from the OS for the monitor - but painting
+diff --git a/src/ui/vulkan/vulkan_device.cpp b/src/ui/vulkan/vulkan_device.cpp
+index 4918661..80653fb 100644
+--- a/src/ui/vulkan/vulkan_device.cpp
++++ b/src/ui/vulkan/vulkan_device.cpp
+@@ -25,6 +25,7 @@
+ #include <rex/string.h>
+ #include <rex/ui/low_latency.h>
+ #include <rex/ui/vulkan/device.h>
++#include <rex/ui/app_background.h>
+ 
+ REXCVAR_DEFINE_BOOL(temporal_aa_device_features, !REX_PLATFORM_PS5, "GPU",
+                     "Temporal anti-aliasing: enable the Vulkan device features FSR uses (16-bit "
+@@ -84,6 +85,49 @@ namespace rex {
+ namespace ui {
+ namespace vulkan {
+ 
++#if REX_PLATFORM_IOS
++namespace {
++PFN_vkQueueSubmit g_real_vkQueueSubmit = nullptr;
++PFN_vkQueuePresentKHR g_real_vkQueuePresentKHR = nullptr;
++PFN_vkAcquireNextImageKHR g_real_vkAcquireNextImageKHR = nullptr;
++
++VKAPI_ATTR VkResult VKAPI_CALL GatedQueueSubmit(VkQueue queue, uint32_t submit_count,
++                                               const VkSubmitInfo* submits, VkFence fence) {
++  WaitWhileAppInBackground();
++  return g_real_vkQueueSubmit(queue, submit_count, submits, fence);
++}
++
++VKAPI_ATTR VkResult VKAPI_CALL GatedQueuePresentKHR(VkQueue queue,
++                                                   const VkPresentInfoKHR* present_info) {
++  WaitWhileAppInBackground();
++  return g_real_vkQueuePresentKHR(queue, present_info);
++}
++
++VKAPI_ATTR VkResult VKAPI_CALL GatedAcquireNextImageKHR(VkDevice device, VkSwapchainKHR swapchain,
++                                                       uint64_t timeout, VkSemaphore semaphore,
++                                                       VkFence fence, uint32_t* image_index) {
++  WaitWhileAppInBackground();
++  return g_real_vkAcquireNextImageKHR(device, swapchain, timeout, semaphore, fence, image_index);
++}
++
++template <typename Functions>
++void InstallBackgroundGate(Functions& dfn) {
++  if (dfn.vkQueueSubmit && dfn.vkQueueSubmit != &GatedQueueSubmit) {
++    g_real_vkQueueSubmit = dfn.vkQueueSubmit;
++    dfn.vkQueueSubmit = &GatedQueueSubmit;
++  }
++  if (dfn.vkQueuePresentKHR && dfn.vkQueuePresentKHR != &GatedQueuePresentKHR) {
++    g_real_vkQueuePresentKHR = dfn.vkQueuePresentKHR;
++    dfn.vkQueuePresentKHR = &GatedQueuePresentKHR;
++  }
++  if (dfn.vkAcquireNextImageKHR && dfn.vkAcquireNextImageKHR != &GatedAcquireNextImageKHR) {
++    g_real_vkAcquireNextImageKHR = dfn.vkAcquireNextImageKHR;
++    dfn.vkAcquireNextImageKHR = &GatedAcquireNextImageKHR;
++  }
++}
++}  // namespace
++#endif
++
+ template <typename Structure, VkStructureType StructureType>
+ struct VulkanFeatures {
+   Structure supported = {StructureType};
+@@ -1069,6 +1113,14 @@ std::unique_ptr<VulkanDevice> VulkanDevice::CreateIfSupported(
+ 
+ #undef XE_UI_VULKAN_FUNCTION
+ 
++#if REX_PLATFORM_IOS
++  // Every thread that hands work to the GPU waits here while the app is in
++  // the background (rex/ui/app_background.h).
++  if (functions_loaded) {
++    InstallBackgroundGate(dfn);
++  }
++#endif
++
+   if (!functions_loaded) {
+     REXLOG_ERROR("Failed to get all Vulkan device function pointers for '{}'",
+                  properties.deviceName);
 diff --git a/src/ui/vulkan/vulkan_instance.cpp b/src/ui/vulkan/vulkan_instance.cpp
 index bb00582..0425471 100644
 --- a/src/ui/vulkan/vulkan_instance.cpp
@@ -349,10 +551,18 @@ index bb00582..0425471 100644
    loader_candidates.emplace_back("libvulkan.dylib");
    loader_candidates.emplace_back("libMoltenVK.dylib");
 diff --git a/src/ui/windowed_app_context_sdl.cpp b/src/ui/windowed_app_context_sdl.cpp
-index dc0b4c2..8f0eb17 100644
+index dc0b4c2..f9ad729 100644
 --- a/src/ui/windowed_app_context_sdl.cpp
 +++ b/src/ui/windowed_app_context_sdl.cpp
-@@ -41,7 +41,12 @@ bool SDLWindowedAppContext::Initialize() {
+@@ -20,6 +20,7 @@
+ #include <rex/cvar.h>
+ #include <rex/logging.h>
+ #include <rex/platform.h>
++#include <rex/ui/app_background.h>
+ #include <rex/ui/flags.h>
+ #include <rex/ui/window_sdl.h>
+ 
+@@ -41,7 +42,12 @@ bool SDLWindowedAppContext::Initialize() {
    // Picked before SDL_InitSubSystem, long before a graphics instance can say
    // which surface extensions it has, so the cvar is the escape hatch.
    std::string requested_driver = REXCVAR_GET(video_driver);
@@ -366,6 +576,21 @@ index dc0b4c2..8f0eb17 100644
    // macOS presents via a CAMetalLayer surface obtained from the Cocoa driver.
    if (requested_driver.empty()) {
      requested_driver = "cocoa";
+@@ -182,6 +188,14 @@ void SDLWindowedAppContext::ProcessEvent(SDL_Event& event) {
+ 
+ bool SDLCALL SDLWindowedAppContext::WatchEvent(void* userdata, SDL_Event* event) {
+   auto* context = static_cast<SDLWindowedAppContext*>(userdata);
++  // iOS: GPU work from the background is refused (and loses the device), so
++  // it is held from the moment the app starts to leave the foreground until it
++  // is fully back. SDL calls watchers synchronously from UIKit's callbacks.
++  if (event->type == SDL_EVENT_WILL_ENTER_BACKGROUND) {
++    SetAppInBackground(true);
++  } else if (event->type == SDL_EVENT_DID_ENTER_FOREGROUND) {
++    SetAppInBackground(false);
++  }
+   if (event->type == SDL_EVENT_QUIT && SDL_IsMainThread() && context->IsInUIThread()) {
+     // Cocoa stops making Metal drawables available as part of its termination
+     // request. Handle the request synchronously while SDL is queueing it,
 diff --git a/src/ui/windowed_app_main_sdl.cpp b/src/ui/windowed_app_main_sdl.cpp
 index 77bb1dc..0c6b368 100644
 --- a/src/ui/windowed_app_main_sdl.cpp

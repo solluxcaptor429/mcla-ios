@@ -36,6 +36,32 @@ __attribute__((constructor(101))) void MclaIosEarlyInit() {
     // Relative paths (a log file named in mcla.toml) land beside the settings.
     chdir(documents.fileSystemRepresentation);
 
+    // The fork's shader pack: the game looks for shaderpack/545407F8.shaderpack
+    // beside its settings (Documents here) and imports what its shader storage
+    // lacks, so the pipelines are built before they are drawn with. Without it
+    // every object is missing until its pipeline has compiled on the fly.
+    NSFileManager* files = [NSFileManager defaultManager];
+    NSString* pack_name = @"shaderpack/545407F8.shaderpack";
+    NSString* bundled = [[[NSBundle mainBundle] resourcePath] stringByAppendingPathComponent:pack_name];
+    NSString* placed = [documents stringByAppendingPathComponent:pack_name];
+    if ([files fileExistsAtPath:bundled]) {
+      unsigned long long bundled_size = [[files attributesOfItemAtPath:bundled error:nil] fileSize];
+      unsigned long long placed_size = [[files attributesOfItemAtPath:placed error:nil] fileSize];
+      if (bundled_size != placed_size) {
+        [files createDirectoryAtPath:[placed stringByDeletingLastPathComponent]
+            withIntermediateDirectories:YES
+                             attributes:nil
+                                  error:nil];
+        [files removeItemAtPath:placed error:nil];
+        NSError* error = nil;
+        BOOL copied = [files copyItemAtPath:bundled toPath:placed error:&error];
+        printf("[mcla-ios] shader pack %s Documents (%llu bytes)%s%s\n", copied ? "copied to" : "NOT copied to",
+               bundled_size, copied ? "" : ": ", copied ? "" : error.localizedDescription.UTF8String);
+      }
+    } else {
+      printf("[mcla-ios] no shader pack in the app bundle\n");
+    }
+
     // Sound with the ring switch off, as a game console would play it; no home
     // indicator over the picture until the screen is touched.
     setenv("SDL_AUDIO_CATEGORY", "playback", 0);
