@@ -30,10 +30,10 @@ permissions:
 
 env:
   SDK_ASSET: rexglue-sdk-source-f5337cdc-7bb14d86c7e0.tar.xz
-  SDK_SHA256: d4fd9dae9220fdf6682fbde8ac4486d1ef4a4203fb6e6be9eedf9cebaa11b059
-  SDK_RELEASE: https://github.com/RenanQueiroz/mcla-recomp/releases/download/v0.3.13
+  SDK_SHA256: 3e6fbeb07a60dfcb0f6e1dfb0e0fa8bb825d82a095dd53748a1002c8e4a8c537
+  SDK_RELEASE: https://github.com/RenanQueiroz/mcla-recomp/releases/download/v0.3.14
   # The fork's commit the archive must hold (its fork/ is the game's host code).
-  FORK_COMMIT: d246b7db0af4284e89b971fc3fd94df0c7a92a01
+  FORK_COMMIT: 7e87fbdcd5c5a9d6cd48b87ee094438d815729d5
   SYNCTHING_VERSION: v2.1.7
   MOLTENVK_URL: https://github.com/KhronosGroup/MoltenVK/releases/download/v1.4.2/MoltenVK-ios.tar
   DEPLOYMENT_TARGET: "17.0"
