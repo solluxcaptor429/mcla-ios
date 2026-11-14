@@ -348,6 +348,24 @@ index bb00582..0425471 100644
    loader_candidates.emplace_back(platform::lib_names::kVulkanLoader);
    loader_candidates.emplace_back("libvulkan.dylib");
    loader_candidates.emplace_back("libMoltenVK.dylib");
+diff --git a/src/ui/windowed_app_context_sdl.cpp b/src/ui/windowed_app_context_sdl.cpp
+index dc0b4c2..8f0eb17 100644
+--- a/src/ui/windowed_app_context_sdl.cpp
++++ b/src/ui/windowed_app_context_sdl.cpp
+@@ -41,7 +41,12 @@ bool SDLWindowedAppContext::Initialize() {
+   // Picked before SDL_InitSubSystem, long before a graphics instance can say
+   // which surface extensions it has, so the cvar is the escape hatch.
+   std::string requested_driver = REXCVAR_GET(video_driver);
+-#if REX_PLATFORM_MAC
++#if REX_PLATFORM_IOS
++  // iOS presents via the CAMetalLayer of UIKit's driver (there is no Cocoa).
++  if (requested_driver.empty()) {
++    requested_driver = "uikit";
++  }
++#elif REX_PLATFORM_MAC
+   // macOS presents via a CAMetalLayer surface obtained from the Cocoa driver.
+   if (requested_driver.empty()) {
+     requested_driver = "cocoa";
 diff --git a/src/ui/windowed_app_main_sdl.cpp b/src/ui/windowed_app_main_sdl.cpp
 index 77bb1dc..0c6b368 100644
 --- a/src/ui/windowed_app_main_sdl.cpp

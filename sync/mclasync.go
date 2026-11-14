@@ -298,13 +298,40 @@ func inSync() (connected int, done bool) {
 		if !in.IsConnectedTo(id) {
 			continue
 		}
-		connected++
 		comp, err := in.Completion(id, conf.FolderID)
-		if err != nil || comp.NeedItems+comp.NeedDeletes > 0 {
+		if err != nil {
+			continue
+		}
+		// Only a device that shares the folder with us now counts: one that
+		// has it paused, or has not said yet, has sent us nothing, and this
+		// device "needing nothing" from it means nothing.
+		state := comp.RemoteState.String()
+		if state != "valid" {
+			noteState(id, state)
+			continue
+		}
+		connected++
+		if comp.NeedItems+comp.NeedDeletes > 0 {
 			done = false
 		}
 	}
 	return connected, done
+}
+
+var reported = map[protocol.DeviceID]string{}
+
+func noteState(id protocol.DeviceID, state string) {
+	if reported[id] == state {
+		return
+	}
+	reported[id] = state
+	name := id.Short().String()
+	for i, p := range peers {
+		if p == id {
+			name = conf.Peers[i].Name
+		}
+	}
+	logf("%s is connected but does not share the folder now (%s)", name, state)
 }
 
 // MclaSyncWait waits until the folder is in sync with the devices that are
@@ -330,7 +357,7 @@ func MclaSyncWait(connectMs, totalMs C.int) C.int {
 	for time.Now().Before(deadline) {
 		connected, done := inSync()
 		if connected == 0 && time.Now().After(connectBy) {
-			logf("no other device reachable after %v: going on with this device's saves", time.Since(start).Round(time.Millisecond))
+			logf("no other device sharing the folder after %v: going on with this device's saves", time.Since(start).Round(time.Millisecond))
 			return 0
 		}
 		if connected > 0 && done {
