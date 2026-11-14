@@ -133,10 +133,10 @@ jobs:
           # The game code's compile output stays out of the public log: on a
           # failure, only the names of what failed and the messages' first
           # lines (file, line, message; no source text) are shown.
-          if ! cmake --build build --target mcla > private/game-build.log 2>&1; then
+          if ! cmake --build build --target mcla -- -k 0 > private/game-build.log 2>&1; then
             echo "::error::the game's build failed"
             grep -E '^FAILED:|error:|ld: |Undefined symbols|"_.*", referenced from' private/game-build.log \
-              | grep -v -E '^\s+[0-9]+ \|' | cut -c1-400 | head -200
+              | grep -v -E '^\s+[0-9]+ \|' | cut -c1-400 | sort | uniq -c | sort -rn | head -150
             exit 1
           fi
           tail -3 private/game-build.log

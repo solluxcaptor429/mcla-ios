@@ -39,6 +39,16 @@ set(REXGLUE_ENABLE_FSR OFF CACHE BOOL "" FORCE)
 set(REXGLUE_BUILD_TESTS OFF CACHE BOOL "" FORCE)
 add_subdirectory("${REXSDK_DIR}" rexglue-sdk)
 
+# Third-party headers the SDK's public headers include. An installed SDK has
+# them in its include folder; a source tree has them here.
+set(MCLA_SDK_THIRDPARTY_INCLUDES
+    "${REXSDK_DIR}/thirdparty/imgui"
+    "${REXSDK_DIR}/thirdparty/renderdoc"
+    "${REXSDK_DIR}/thirdparty/xxHash"
+    "${REXSDK_DIR}/thirdparty/utfcpp/source"
+    "${REXSDK_DIR}/thirdparty/o1heap/o1heap"
+    "${REXSDK_DIR}/thirdparty/disruptorplus/include")
+
 # --- The recompiled game code ---------------------------------------------------------
 include("${MCLA_GENERATED_DIR}/sources.cmake")
 
@@ -48,6 +58,7 @@ target_include_directories(mcla_recomp PRIVATE
     "${MCLA_FORK_DIR}/src"
     "${MCLA_GENERATED_DIR}"
     "${CMAKE_CURRENT_BINARY_DIR}/include")
+target_include_directories(mcla_recomp SYSTEM PRIVATE ${MCLA_SDK_THIRDPARTY_INCLUDES})
 target_link_libraries(mcla_recomp PRIVATE rex::runtime)
 rexglue_apply_target_settings(mcla_recomp)
 target_precompile_headers(mcla_recomp PRIVATE "${MCLA_GENERATED_DIR}/mcla_pch.h")
@@ -86,6 +97,7 @@ target_include_directories(mcla PRIVATE
     "${MCLA_FORK_DIR}/src"
     "${MCLA_GENERATED_DIR}"
     "${CMAKE_CURRENT_BINARY_DIR}/include")
+target_include_directories(mcla SYSTEM PRIVATE ${MCLA_SDK_THIRDPARTY_INCLUDES})
 target_compile_options(mcla PRIVATE -fno-strict-aliasing -fno-char8_t -ffp-contract=off)
 set_source_files_properties(ios_support.mm PROPERTIES COMPILE_OPTIONS "-fobjc-arc")
 
