@@ -192,7 +192,7 @@ jobs:
           MCLA_PRIVATE_REPO: ${{ secrets.MCLA_PRIVATE_REPO }}
           MCLA_PASSPHRASE: ${{ secrets.MCLA_PASSPHRASE }}
         run: |
-          branch="build-${{ github.run_number }}"
+          branch="build-${{ github.run_number }}-${{ github.run_id }}"
           mkdir private/out && cd private/out
           openssl enc -aes-256-cbc -pbkdf2 -iter 200000 -pass env:MCLA_PASSPHRASE -in ../mcla.ipa -out mcla.ipa.enc
           shasum -a 256 mcla.ipa.enc > SHA256SUMS
