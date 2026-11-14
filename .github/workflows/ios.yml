@@ -91,7 +91,7 @@ jobs:
           export CC="$(xcrun --sdk iphoneos -f clang) -isysroot $sdk -arch arm64 -miphoneos-version-min=$DEPLOYMENT_TARGET"
           export CGO_LDFLAGS="-arch arm64"
           go version
-          go build -trimpath -tags "noupgrade,sqlite_omit_load_extension" -ldflags "-s -w" \
+          go build -trimpath -tags "noupgrade,noassets,sqlite_omit_load_extension" -ldflags "-s -w" \
             -buildmode=c-archive -o "$GITHUB_WORKSPACE/mclasync/libmclasync.a" ./cmd/mclasync
           ls -la "$GITHUB_WORKSPACE/mclasync"
 
