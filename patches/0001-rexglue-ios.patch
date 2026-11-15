@@ -210,6 +210,83 @@ index 0000000..e4ef172
 +GpuCallStats GetGpuCallStats();
 +
 +}  // namespace rex::ui
+diff --git a/src/core/exception_handler_posix.cpp b/src/core/exception_handler_posix.cpp
+index 8b1c76a..6bf72e9 100644
+--- a/src/core/exception_handler_posix.cpp
++++ b/src/core/exception_handler_posix.cpp
+@@ -31,8 +31,59 @@
+ 
+ #include <ucontext.h>
+ 
++#if REX_PLATFORM_IOS
++#include <dlfcn.h>
++#include <cstdio>
++#endif
++
+ namespace rex::arch {
+ 
++#if REX_PLATFORM_IOS
++namespace {
++// A fault nobody handled is the game (or the runtime) crashing. Returning from
++// the signal handler would run the faulting instruction again, for ever: the
++// app froze and filled its log instead of ending. Say where it was, with the
++// functions' names (recompiled guest functions are sub_<guest address>), and
++// let the default action end the process.
++void ReportUnhandledFault(int signal_number, const void* fault_address, uint64_t pc, uint64_t fp,
++                          uint64_t lr) {
++  std::printf("[mcla-crash] signal %d at address %p, pc 0x%llx\n", signal_number, fault_address,
++              static_cast<unsigned long long>(pc));
++  uint64_t frames[40];
++  int count = 0;
++  frames[count++] = pc;
++  frames[count++] = lr;
++  while (fp && !(fp & 7) && count < 40) {
++    const uint64_t* record = reinterpret_cast<const uint64_t*>(fp);
++    const uint64_t next = record[0];
++    const uint64_t return_address = record[1] & 0x00007FFFFFFFFFFFull;
++    if (!return_address) {
++      break;
++    }
++    frames[count++] = return_address;
++    if (next <= fp) {
++      break;
++    }
++    fp = next;
++  }
++  for (int i = 0; i < count; ++i) {
++    Dl_info info;
++    if (dladdr(reinterpret_cast<void*>(frames[i]), &info) && info.dli_fname) {
++      const char* image = std::strrchr(info.dli_fname, '/');
++      image = image ? image + 1 : info.dli_fname;
++      std::printf("[mcla-crash]   %2d %s %s+0x%llx\n", i, image, info.dli_sname ? info.dli_sname : "?",
++                  static_cast<unsigned long long>(
++                      frames[i] - reinterpret_cast<uint64_t>(info.dli_sname ? info.dli_saddr
++                                                                            : info.dli_fbase)));
++    } else {
++      std::printf("[mcla-crash]   %2d 0x%llx\n", i, static_cast<unsigned long long>(frames[i]));
++    }
++  }
++  std::fflush(stdout);
++}
++}  // namespace
++#endif
++
+ bool signal_handlers_installed_ = false;
+ struct sigaction original_sigill_handler_;
+ struct sigaction original_sigsegv_handler_;
+@@ -417,6 +468,12 @@ static void ExceptionHandlerCallback(int signal_number, siginfo_t* signal_info,
+       return;
+     }
+   }
++#if REX_PLATFORM_IOS
++  // The default action first: a fault while reporting then ends the process too.
++  signal(signal_number, SIG_DFL);
++  ReportUnhandledFault(signal_number, signal_info->si_addr, thread_context.pc, thread_context.x[29],
++                       thread_context.x[30]);
++#endif
+ }
+ 
+ void ExceptionHandler::Install(Handler fn, void* data) {
 diff --git a/src/core/filesystem_posix.cpp b/src/core/filesystem_posix.cpp
 index d3de48a..d55c572 100644
 --- a/src/core/filesystem_posix.cpp
