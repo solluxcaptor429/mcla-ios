@@ -331,6 +331,25 @@ index 87734e2..2acea45 100644
  #if REX_PLATFORM_PS5
    if (handle == kDirectMemoryHandle) {
      if (g_direct_start < 0 || file_offset + length > g_direct_length) {
+diff --git a/src/core/threading_posix.cpp b/src/core/threading_posix.cpp
+index a656a20..c0f5dcd 100644
+--- a/src/core/threading_posix.cpp
++++ b/src/core/threading_posix.cpp
+@@ -419,8 +419,12 @@ class PosixConditionBase {
+       if (timeout == std::chrono::milliseconds::max()) {
+         std::this_thread::sleep_for(std::chrono::milliseconds(1));
+       } else {
+-        auto remaining = std::chrono::duration_cast<std::chrono::milliseconds>(end_time - now);
+-        auto sleep_time = std::min(remaining, std::chrono::milliseconds(1));
++        // Not in whole milliseconds: what is left of a 1 ms slice (every
++        // alertable wait is made of those) rounds down to 0, and sleeping for
++        // 0 turned the wait into a loop that kept a core busy.
++        auto remaining = end_time - now;
++        auto sleep_time =
++            std::min<std::chrono::steady_clock::duration>(remaining, std::chrono::milliseconds(1));
+         std::this_thread::sleep_for(sleep_time);
+       }
+     }
 diff --git a/src/graphics/CMakeLists.txt b/src/graphics/CMakeLists.txt
 index a910d57..660ae53 100644
 --- a/src/graphics/CMakeLists.txt

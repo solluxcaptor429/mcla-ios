@@ -74,6 +74,14 @@ jobs:
             echo "applying $(basename "$patch")"
             patch -p1 --no-backup-if-mismatch < "$patch"
           done
+          # The game host's wait for the GPU (mcla_fence_spin) gives its core
+          # away every 64th poll with yield(), which on iOS comes straight
+          # back: the thread kept a core at 90% while the GPU was the limit.
+          # A 50 microsecond sleep there instead (one edit, by pattern: the
+          # fork's sources have CRLF line ends, which a patch file in git
+          # would not keep).
+          perl -0pi -e 's/(\(\+\+spins & 0x3F\) == 0\) \{\r?\n\s*)std::this_thread::yield\(\);/$1std::this_thread::sleep_for(std::chrono::microseconds(50));/' ../fork/src/render_perf.cpp
+          grep -q 'sleep_for(std::chrono::microseconds(50))' ../fork/src/render_perf.cpp
 
       - uses: actions/setup-go@v5
         with:
