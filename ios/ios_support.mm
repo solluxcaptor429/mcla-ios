@@ -15,10 +15,12 @@
 
 #include <iterator>
 
+#include <dlfcn.h>
 #include <mach/mach.h>
 #include <pthread.h>
 
 #include <algorithm>
+#include <map>
 #include <string>
 #include <thread>
 #include <vector>
@@ -76,6 +78,23 @@ __attribute__((constructor(101))) void MclaIosEarlyInit() {
       printf("[mcla-ios] no shader pack in the app bundle\n");
     }
 
+    // Documents/mcla-env.txt: NAME=value lines set as environment variables
+    // before anything reads them (MoltenVK's MVK_CONFIG_*, SDL hints, the
+    // MCLA_* switches below): settings to try without another build.
+    NSString* env_file = [documents stringByAppendingPathComponent:@"mcla-env.txt"];
+    NSString* env_text = [NSString stringWithContentsOfFile:env_file encoding:NSUTF8StringEncoding error:nil];
+    for (NSString* raw in [env_text componentsSeparatedByCharactersInSet:NSCharacterSet.newlineCharacterSet]) {
+      NSString* line = [raw stringByTrimmingCharactersInSet:NSCharacterSet.whitespaceCharacterSet];
+      const NSRange equals = [line rangeOfString:@"="];
+      if (line.length == 0 || [line hasPrefix:@"#"] || equals.location == NSNotFound) {
+        continue;
+      }
+      NSString* name = [line substringToIndex:equals.location];
+      NSString* value = [line substringFromIndex:equals.location + 1];
+      setenv(name.UTF8String, value.UTF8String, 1);
+      printf("[mcla-ios] mcla-env.txt: %s=%s\n", name.UTF8String, value.UTF8String);
+    }
+
     // Sound with the ring switch off, as a game console would play it; no home
     // indicator over the picture until the screen is touched.
     setenv("SDL_AUDIO_CATEGORY", "playback", 0);
@@ -106,6 +125,137 @@ int ModelGeneration(const char* machine, const char* kind) {
   return atoi(machine + length);
 }
 
+// --- Where the time goes: a sampling profiler --------------------------------
+//
+// With MCLA_PROFILE=1 (mcla-env.txt), each perf line is followed by where the
+// busiest threads and the GPU command thread were in 100 samples taken over
+// half a second: the innermost named frames of the most frequent stacks.
+// A thread is suspended for a sample; nothing between suspend and resume
+// allocates, logs or takes a lock (the thread may hold malloc's).
+
+constexpr int kProfileFrames = 20;
+constexpr int kProfileSamples = 100;
+constexpr int kProfileThreads = 4;
+
+struct ProfileSample {
+  uint64_t frames[kProfileFrames];
+  int count;
+};
+ProfileSample g_profile_samples[kProfileThreads][kProfileSamples];
+
+uint64_t StripPointer(uint64_t pointer) { return pointer & 0x00007FFFFFFFFFFFull; }
+
+void SampleThread(thread_act_t thread, ProfileSample* sample) {
+  sample->count = 0;
+  if (thread_suspend(thread) != KERN_SUCCESS) {
+    return;
+  }
+  arm_thread_state64_t state;
+  mach_msg_type_number_t state_count = ARM_THREAD_STATE64_COUNT;
+  if (thread_get_state(thread, ARM_THREAD_STATE64, reinterpret_cast<thread_state_t>(&state),
+                       &state_count) == KERN_SUCCESS) {
+    sample->frames[sample->count++] = StripPointer(arm_thread_state64_get_pc(state));
+    uint64_t fp = arm_thread_state64_get_fp(state);
+    while (fp && !(fp & 7) && sample->count < kProfileFrames) {
+      uint64_t record[2];
+      vm_size_t read = 0;
+      if (vm_read_overwrite(mach_task_self(), fp, sizeof(record),
+                            reinterpret_cast<vm_address_t>(record), &read) != KERN_SUCCESS ||
+          read != sizeof(record)) {
+        break;
+      }
+      const uint64_t return_address = StripPointer(record[1]);
+      if (!return_address) {
+        break;
+      }
+      sample->frames[sample->count++] = return_address;
+      if (record[0] <= fp) {
+        break;
+      }
+      fp = record[0];
+    }
+  }
+  thread_resume(thread);
+}
+
+std::string SymbolName(uint64_t address, std::map<uint64_t, std::string>& cache) {
+  auto found = cache.find(address);
+  if (found != cache.end()) {
+    return found->second;
+  }
+  std::string name;
+  Dl_info info;
+  if (dladdr(reinterpret_cast<void*>(address), &info) && info.dli_fname) {
+    const char* image = strrchr(info.dli_fname, '/');
+    image = image ? image + 1 : info.dli_fname;
+    char text[200];
+    if (info.dli_sname) {
+      snprintf(text, sizeof(text), "%.110s", info.dli_sname);
+    } else {
+      snprintf(text, sizeof(text), "%.40s+0x%llx", image,
+               (unsigned long long)(address - reinterpret_cast<uint64_t>(info.dli_fbase)));
+    }
+    name = text;
+  } else {
+    char text[32];
+    snprintf(text, sizeof(text), "0x%llx", (unsigned long long)address);
+    name = text;
+  }
+  cache[address] = name;
+  return name;
+}
+
+struct ProfileTarget {
+  thread_act_t thread;
+  std::string name;
+};
+
+void ProfileThreads(const std::vector<ProfileTarget>& targets) {
+  const int thread_count = int(std::min<size_t>(targets.size(), kProfileThreads));
+  for (int sample = 0; sample < kProfileSamples; ++sample) {
+    for (int t = 0; t < thread_count; ++t) {
+      SampleThread(targets[t].thread, &g_profile_samples[t][sample]);
+    }
+    usleep(5000);
+  }
+  static std::map<uint64_t, std::string> cache;
+  for (int t = 0; t < thread_count; ++t) {
+    std::map<std::string, int> stacks;
+    std::map<std::string, int> leaves;
+    for (int sample = 0; sample < kProfileSamples; ++sample) {
+      const ProfileSample& taken = g_profile_samples[t][sample];
+      if (!taken.count) {
+        continue;
+      }
+      std::string stack;
+      for (int f = 0; f < taken.count && f < 7; ++f) {
+        stack += (f ? " < " : "") + SymbolName(taken.frames[f], cache);
+      }
+      ++stacks[stack];
+      ++leaves[SymbolName(taken.frames[0], cache)];
+    }
+    std::vector<std::pair<int, std::string>> order;
+    for (const auto& [stack, count] : stacks) {
+      order.emplace_back(count, stack);
+    }
+    std::sort(order.rbegin(), order.rend());
+    printf("[mcla-prof] %s: %zu distinct stacks\n", targets[t].name.c_str(), order.size());
+    for (size_t i = 0; i < order.size() && i < 6; ++i) {
+      printf("[mcla-prof]   %3d%% %s\n", order[i].first, order[i].second.c_str());
+    }
+    order.clear();
+    for (const auto& [leaf, count] : leaves) {
+      order.emplace_back(count, leaf);
+    }
+    std::sort(order.rbegin(), order.rend());
+    std::string line;
+    for (size_t i = 0; i < order.size() && i < 8; ++i) {
+      line += (i ? ", " : "") + std::to_string(order[i].first) + "% " + order[i].second;
+    }
+    printf("[mcla-prof]   leaves: %s\n", line.c_str());
+  }
+}
+
 // A line every five seconds while the game is in front: frames presented a
 // second, what the Vulkan calls that hand work to Metal cost a frame, the
 // phone's thermal state, and the threads that use the most CPU. It is what
@@ -116,7 +266,10 @@ void PerfLogThread() {
   struct Usage {
     std::string name;
     int permille;
+    thread_act_t thread;
   };
+  const char* profile_setting = getenv("MCLA_PROFILE");
+  const bool profile = profile_setting && profile_setting[0] == '1';
   rex::ui::GpuCallStats before = rex::ui::GetGpuCallStats();
   const int kSeconds = 5;
   for (int elapsed = kSeconds;; elapsed += kSeconds) {
@@ -151,14 +304,14 @@ void PerfLogThread() {
             pthread_getname_np(thread, name, sizeof(name));
           }
           total += info.cpu_usage;
-          if (info.cpu_usage >= 30) {
-            usage.push_back({name[0] ? name : "(unnamed)", int(info.cpu_usage)});
+          const bool gpu_thread = strncmp(name, "GPU Commands", 12) == 0;
+          if (info.cpu_usage >= 30 || gpu_thread) {
+            // The GPU command thread first: it is the one the frame waits for.
+            usage.push_back({name[0] ? name : "(unnamed)",
+                             int(info.cpu_usage) + (gpu_thread ? 100000 : 0), threads[i]});
           }
         }
-        mach_port_deallocate(mach_task_self(), threads[i]);
       }
-      vm_deallocate(mach_task_self(), reinterpret_cast<vm_address_t>(threads),
-                    thread_count * sizeof(thread_act_t));
     }
     std::sort(usage.begin(), usage.end(),
               [](const Usage& a, const Usage& b) { return a.permille > b.permille; });
@@ -166,13 +319,30 @@ void PerfLogThread() {
     for (size_t i = 0; i < usage.size() && i < 8; ++i) {
       char item[96];
       snprintf(item, sizeof(item), "%s%s %d%%", i ? ", " : "", usage[i].name.c_str(),
-               usage[i].permille / 10);
+               (usage[i].permille % 100000) / 10);
       top += item;
     }
     printf("[mcla-perf] %4ds  %.1f fps, %.1f submits/frame; per frame: submit %.1f ms, present %.1f ms, "
            "acquire %.1f ms; thermal %ld; %d threads, cpu %d%%: %s\n",
            elapsed, presents / kSeconds, submits / frames, ms[0], ms[1], ms[2],
            (long)NSProcessInfo.processInfo.thermalState, int(thread_count), total / 10, top.c_str());
+    if (profile && presents > 0) {
+      std::vector<ProfileTarget> targets;
+      const pthread_t self = pthread_self();
+      for (const Usage& candidate : usage) {
+        if (pthread_from_mach_thread_np(candidate.thread) != self) {
+          targets.push_back({candidate.thread, candidate.name});
+        }
+      }
+      ProfileThreads(targets);
+    }
+    for (mach_msg_type_number_t i = 0; i < thread_count; ++i) {
+      mach_port_deallocate(mach_task_self(), threads[i]);
+    }
+    if (threads) {
+      vm_deallocate(mach_task_self(), reinterpret_cast<vm_address_t>(threads),
+                    thread_count * sizeof(thread_act_t));
+    }
   }
 }
 
@@ -217,7 +387,9 @@ extern "C" void MclaIosApplyDeviceDefaults(void) {
   // the first devices (the part past the console's 2,048 tiles, it seems): the
   // console's size here, set as the command line would so that the PC default
   // doesn't replace it.
-  rex::cvar::SetFlagFromCommandLine("edram_tiles", "2048");
+  // (MCLA_EDRAM_TILES=4096 in mcla-env.txt brings the fork's back, to study it.)
+  const char* edram_tiles = getenv("MCLA_EDRAM_TILES");
+  rex::cvar::SetFlagFromCommandLine("edram_tiles", edram_tiles ? edram_tiles : "2048");
 
   std::thread(PerfLogThread).detach();
 

@@ -180,7 +180,7 @@ jobs:
           cp src-archive/fork/LICENSE "$app/LICENSE.txt"
           cp src-archive/fork/THIRD-PARTY-NOTICES.md "$app/THIRD-PARTY-NOTICES.md"
           if [ -d src-archive/fork/shaderpack ]; then cp -R src-archive/fork/shaderpack "$app/shaderpack"; fi
-          strip -x "$app/mcla"
+          # Not stripped: the profiler (MCLA_PROFILE=1) names frames with dladdr.
           codesign --force --sign - "$app/Frameworks/MoltenVK.framework"
           codesign --force --sign - --entitlements ios/mcla.entitlements "$app"
           lipo -info "$app/mcla"; otool -L "$app/mcla"; du -sh "$app"
