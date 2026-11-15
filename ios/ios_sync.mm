@@ -79,7 +79,10 @@ void ObserveAppState() {
 
 }  // namespace
 
+extern "C" void MclaIosApplyDeviceDefaults(void);  // ios_support.mm
+
 extern "C" void rex_ios_before_app(void) {
+  MclaIosApplyDeviceDefaults();
 #if MCLA_HAVE_SYNC
   @autoreleasepool {
     NSString* home = NSHomeDirectory();

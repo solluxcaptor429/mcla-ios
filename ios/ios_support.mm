@@ -9,8 +9,13 @@
 #include <os/proc.h>
 #include <stdio.h>
 #include <stdlib.h>
+#include <string.h>
 #include <sys/sysctl.h>
 #include <unistd.h>
+
+#include <iterator>
+
+#include <rex/cvar.h>
 
 namespace {
 
@@ -83,4 +88,54 @@ __attribute__((constructor(101))) void MclaIosEarlyInit() {
   }
 }
 
+// "iPad16,3" -> 16; 0 when it isn't a model of that kind.
+int ModelGeneration(const char* machine, const char* kind) {
+  const size_t length = strlen(kind);
+  if (strncmp(machine, kind, length) != 0) {
+    return 0;
+  }
+  return atoi(machine + length);
+}
+
 }  // namespace
+
+// Graphics defaults by device, set before the settings are read: what the
+// player sets in the pause menu or in Documents/mcla.toml still wins, and these
+// are never written there as if chosen.
+//
+//   iPad Pro with M4 or later (iPad16,3-6 and newer, 8 GB or more): the
+//   console's 720p drawn at 2x (1440p, close to the 13" panel's 2064 rows)
+//   and the game's 60 FPS cap; the M4's CPU and 10-core GPU are a Mac's.
+//   iPhone (the Pro Max, the foldable): the console's 720p and the game's own
+//   30 FPS cap, the GPU's headroom left to the EDRAM emulation. The screen's
+//   shape is the game's own business (mcla_aspect_ratio auto: wider than 16:9
+//   widens the view, narrower, as the foldable's and the iPad's 4:3 are,
+//   keeps 16:9 with bars).
+extern "C" void MclaIosApplyDeviceDefaults(void) {
+  char machine[64] = "";
+  size_t machine_size = sizeof(machine);
+  sysctlbyname("hw.machine", machine, &machine_size, nullptr, 0);
+  uint64_t physical = 0;
+  size_t physical_size = sizeof(physical);
+  sysctlbyname("hw.memsize", &physical, &physical_size, nullptr, 0);
+
+  const int ipad = ModelGeneration(machine, "iPad");
+  // iPad16,1/2 is the iPad mini with the A17 Pro: a phone's GPU.
+  const bool ipad_mini_a17 = strcmp(machine, "iPad16,1") == 0 || strcmp(machine, "iPad16,2") == 0;
+  const bool large = ipad >= 16 && !ipad_mini_a17 && (physical >> 30) >= 7;
+
+  struct Default {
+    const char* name;
+    const char* value;
+  };
+  const Default large_defaults[] = {{"resolution_scale", "2"}, {"mcla_fps", "60"}};
+  const Default small_defaults[] = {{"resolution_scale", "1"}};
+  const Default* defaults = large ? large_defaults : small_defaults;
+  const size_t count = large ? std::size(large_defaults) : std::size(small_defaults);
+
+  printf("[mcla-ios] device class: %s (%s)\n", large ? "M-class iPad" : "phone-class", machine);
+  for (size_t i = 0; i < count; ++i) {
+    const bool taken = rex::cvar::SetDefaultValue(defaults[i].name, defaults[i].value);
+    printf("[mcla-ios]   %s = %s%s\n", defaults[i].name, defaults[i].value, taken ? "" : " (not taken)");
+  }
+}

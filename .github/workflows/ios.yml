@@ -146,7 +146,8 @@ jobs:
             -DMCLA_FORK_DIR="$PWD/src-archive/fork" \
             -DMCLA_GENERATED_DIR="$PWD/private/generated" \
             -DMCLA_SYNC_LIB="$PWD/mclasync/libmclasync.a" \
-            -DMCLA_BUNDLE_VERSION="${{ github.run_number }}"
+            -DMCLA_BUNDLE_VERSION="${{ github.run_number }}" \
+            -DMCLA_GAME_VERSION="${SDK_RELEASE##*/v}"
 
       - name: Build the runtime
         run: |

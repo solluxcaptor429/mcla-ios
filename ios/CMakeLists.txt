@@ -22,6 +22,7 @@ set(MCLA_FORK_DIR "" CACHE PATH "mcla-recomp checkout (its src/ is the game's ho
 set(MCLA_GENERATED_DIR "" CACHE PATH "generated/default: the recompiled game code")
 set(MCLA_BUNDLE_ID "com.solluxcaptor.mcla" CACHE STRING "CFBundleIdentifier")
 set(MCLA_BUNDLE_VERSION "1" CACHE STRING "CFBundleVersion")
+set(MCLA_GAME_VERSION "0.3.14" CACHE STRING "CFBundleShortVersionString: the mcla-recomp release built")
 
 foreach(_dir REXSDK_DIR MCLA_FORK_DIR MCLA_GENERATED_DIR)
     if(NOT IS_DIRECTORY "${${_dir}}")
