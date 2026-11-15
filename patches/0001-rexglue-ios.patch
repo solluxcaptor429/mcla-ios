@@ -162,10 +162,10 @@ index 5f0afef..bb6b8d8 100644
  #endif
 diff --git a/include/rex/ui/app_background.h b/include/rex/ui/app_background.h
 new file mode 100644
-index 0000000..41341d8
+index 0000000..c08877c
 --- /dev/null
 +++ b/include/rex/ui/app_background.h
-@@ -0,0 +1,35 @@
+@@ -0,0 +1,39 @@
 +/**
 + * @file        rex/ui/app_background.h
 + * @brief       Holding GPU work while an iOS app is in the background
@@ -192,10 +192,14 @@ index 0000000..41341d8
 +void WaitWhileAppInBackground();
 +
 +// What the gated calls cost, for a performance log: calls and nanoseconds in
-+// vkQueueSubmit (0), vkQueuePresentKHR (1) and vkAcquireNextImageKHR (2) so far.
++// vkQueueSubmit (0), vkQueuePresentKHR (1) and vkAcquireNextImageKHR (2) so far,
++// and calls only of what is recorded into command buffers: render passes begun
++// (3), draws (4), buffer copies (5), buffer-to-image copies (6), compute
++// dispatches (7), pipeline barriers (8) and pipeline binds (9).
++constexpr int kGpuCallKinds = 10;
 +struct GpuCallStats {
-+  unsigned long long calls[3];
-+  unsigned long long nanoseconds[3];
++  unsigned long long calls[kGpuCallKinds];
++  unsigned long long nanoseconds[kGpuCallKinds];
 +};
 +void AddGpuCall(int kind, unsigned long long nanoseconds);
 +GpuCallStats GetGpuCallStats();
@@ -416,7 +420,7 @@ index e1695f8..e7559f2 100644
      image_decode.cpp
 diff --git a/src/ui/app_background.cpp b/src/ui/app_background.cpp
 new file mode 100644
-index 0000000..e698ccc
+index 0000000..4bbcb11
 --- /dev/null
 +++ b/src/ui/app_background.cpp
 @@ -0,0 +1,68 @@
@@ -470,8 +474,8 @@ index 0000000..e698ccc
 +  g_resumed.wait(lock, [] { return !g_in_background.load(std::memory_order_acquire); });
 +}
 +
-+std::atomic<unsigned long long> g_gpu_calls[3];
-+std::atomic<unsigned long long> g_gpu_nanoseconds[3];
++std::atomic<unsigned long long> g_gpu_calls[kGpuCallKinds];
++std::atomic<unsigned long long> g_gpu_nanoseconds[kGpuCallKinds];
 +
 +void AddGpuCall(int kind, unsigned long long nanoseconds) {
 +  g_gpu_calls[kind].fetch_add(1, std::memory_order_relaxed);
@@ -480,7 +484,7 @@ index 0000000..e698ccc
 +
 +GpuCallStats GetGpuCallStats() {
 +  GpuCallStats stats;
-+  for (int i = 0; i < 3; ++i) {
++  for (int i = 0; i < kGpuCallKinds; ++i) {
 +    stats.calls[i] = g_gpu_calls[i].load(std::memory_order_relaxed);
 +    stats.nanoseconds[i] = g_gpu_nanoseconds[i].load(std::memory_order_relaxed);
 +  }
@@ -513,7 +517,7 @@ index 75d29b1..b01430a 100644
    // paint. However, an explicit monitor check is needed because UI framerate
    // limiting may be tied to signals from the OS for the monitor - but painting
 diff --git a/src/ui/vulkan/vulkan_device.cpp b/src/ui/vulkan/vulkan_device.cpp
-index 4918661..40c9312 100644
+index 4918661..dbc34c7 100644
 --- a/src/ui/vulkan/vulkan_device.cpp
 +++ b/src/ui/vulkan/vulkan_device.cpp
 @@ -9,6 +9,7 @@
@@ -532,7 +536,7 @@ index 4918661..40c9312 100644
  
  REXCVAR_DEFINE_BOOL(temporal_aa_device_features, !REX_PLATFORM_PS5, "GPU",
                      "Temporal anti-aliasing: enable the Vulkan device features FSR uses (16-bit "
-@@ -84,6 +86,63 @@ namespace rex {
+@@ -84,6 +86,150 @@ namespace rex {
  namespace ui {
  namespace vulkan {
  
@@ -575,8 +579,95 @@ index 4918661..40c9312 100644
 +  return g_real_vkAcquireNextImageKHR(device, swapchain, timeout, semaphore, fence, image_index);
 +}
 +
++// Counted only (rex/ui/app_background.h): what a frame is made of.
++PFN_vkCmdBeginRenderPass g_real_vkCmdBeginRenderPass = nullptr;
++PFN_vkCmdDraw g_real_vkCmdDraw = nullptr;
++PFN_vkCmdBeginRendering g_real_vkCmdBeginRendering = nullptr;
++PFN_vkCmdDrawIndexed g_real_vkCmdDrawIndexed = nullptr;
++PFN_vkCmdCopyBuffer g_real_vkCmdCopyBuffer = nullptr;
++PFN_vkCmdCopyBufferToImage g_real_vkCmdCopyBufferToImage = nullptr;
++PFN_vkCmdDispatch g_real_vkCmdDispatch = nullptr;
++PFN_vkCmdPipelineBarrier g_real_vkCmdPipelineBarrier = nullptr;
++PFN_vkCmdBindPipeline g_real_vkCmdBindPipeline = nullptr;
++
++VKAPI_ATTR void VKAPI_CALL CountedCmdBeginRenderPass(VkCommandBuffer command_buffer,
++                                                    const VkRenderPassBeginInfo* begin_info,
++                                                    VkSubpassContents contents) {
++  AddGpuCall(3, 0);
++  g_real_vkCmdBeginRenderPass(command_buffer, begin_info, contents);
++}
++VKAPI_ATTR void VKAPI_CALL CountedCmdBeginRendering(VkCommandBuffer command_buffer,
++                                                   const VkRenderingInfo* rendering_info) {
++  AddGpuCall(3, 0);
++  g_real_vkCmdBeginRendering(command_buffer, rendering_info);
++}
++VKAPI_ATTR void VKAPI_CALL CountedCmdDraw(VkCommandBuffer command_buffer, uint32_t vertex_count,
++                                         uint32_t instance_count, uint32_t first_vertex,
++                                         uint32_t first_instance) {
++  AddGpuCall(4, 0);
++  g_real_vkCmdDraw(command_buffer, vertex_count, instance_count, first_vertex, first_instance);
++}
++VKAPI_ATTR void VKAPI_CALL CountedCmdDrawIndexed(VkCommandBuffer command_buffer,
++                                                uint32_t index_count, uint32_t instance_count,
++                                                uint32_t first_index, int32_t vertex_offset,
++                                                uint32_t first_instance) {
++  AddGpuCall(4, 0);
++  g_real_vkCmdDrawIndexed(command_buffer, index_count, instance_count, first_index, vertex_offset,
++                          first_instance);
++}
++VKAPI_ATTR void VKAPI_CALL CountedCmdCopyBuffer(VkCommandBuffer command_buffer, VkBuffer source,
++                                               VkBuffer destination, uint32_t region_count,
++                                               const VkBufferCopy* regions) {
++  AddGpuCall(5, 0);
++  g_real_vkCmdCopyBuffer(command_buffer, source, destination, region_count, regions);
++}
++VKAPI_ATTR void VKAPI_CALL CountedCmdCopyBufferToImage(VkCommandBuffer command_buffer,
++                                                      VkBuffer source, VkImage destination,
++                                                      VkImageLayout layout, uint32_t region_count,
++                                                      const VkBufferImageCopy* regions) {
++  AddGpuCall(6, 0);
++  g_real_vkCmdCopyBufferToImage(command_buffer, source, destination, layout, region_count, regions);
++}
++VKAPI_ATTR void VKAPI_CALL CountedCmdDispatch(VkCommandBuffer command_buffer, uint32_t x,
++                                             uint32_t y, uint32_t z) {
++  AddGpuCall(7, 0);
++  g_real_vkCmdDispatch(command_buffer, x, y, z);
++}
++VKAPI_ATTR void VKAPI_CALL CountedCmdPipelineBarrier(
++    VkCommandBuffer command_buffer, VkPipelineStageFlags source_stages,
++    VkPipelineStageFlags destination_stages, VkDependencyFlags dependency_flags,
++    uint32_t memory_barrier_count, const VkMemoryBarrier* memory_barriers,
++    uint32_t buffer_barrier_count, const VkBufferMemoryBarrier* buffer_barriers,
++    uint32_t image_barrier_count, const VkImageMemoryBarrier* image_barriers) {
++  AddGpuCall(8, 0);
++  g_real_vkCmdPipelineBarrier(command_buffer, source_stages, destination_stages, dependency_flags,
++                              memory_barrier_count, memory_barriers, buffer_barrier_count,
++                              buffer_barriers, image_barrier_count, image_barriers);
++}
++VKAPI_ATTR void VKAPI_CALL CountedCmdBindPipeline(VkCommandBuffer command_buffer,
++                                                 VkPipelineBindPoint bind_point,
++                                                 VkPipeline pipeline) {
++  AddGpuCall(9, 0);
++  g_real_vkCmdBindPipeline(command_buffer, bind_point, pipeline);
++}
++
 +template <typename Functions>
 +void InstallBackgroundGate(Functions& dfn) {
++#define REX_IOS_COUNT(name)                                \
++  if (dfn.vk##name && dfn.vk##name != &Counted##name) {    \
++    g_real_vk##name = dfn.vk##name;                        \
++    dfn.vk##name = &Counted##name;                         \
++  }
++  REX_IOS_COUNT(CmdBeginRenderPass)
++  REX_IOS_COUNT(CmdBeginRendering)
++  REX_IOS_COUNT(CmdDraw)
++  REX_IOS_COUNT(CmdDrawIndexed)
++  REX_IOS_COUNT(CmdCopyBuffer)
++  REX_IOS_COUNT(CmdCopyBufferToImage)
++  REX_IOS_COUNT(CmdDispatch)
++  REX_IOS_COUNT(CmdPipelineBarrier)
++  REX_IOS_COUNT(CmdBindPipeline)
++#undef REX_IOS_COUNT
 +  if (dfn.vkQueueSubmit && dfn.vkQueueSubmit != &GatedQueueSubmit) {
 +    g_real_vkQueueSubmit = dfn.vkQueueSubmit;
 +    dfn.vkQueueSubmit = &GatedQueueSubmit;
@@ -596,7 +687,7 @@ index 4918661..40c9312 100644
  template <typename Structure, VkStructureType StructureType>
  struct VulkanFeatures {
    Structure supported = {StructureType};
-@@ -1069,6 +1128,14 @@ std::unique_ptr<VulkanDevice> VulkanDevice::CreateIfSupported(
+@@ -1069,6 +1215,14 @@ std::unique_ptr<VulkanDevice> VulkanDevice::CreateIfSupported(
  
  #undef XE_UI_VULKAN_FUNCTION
  

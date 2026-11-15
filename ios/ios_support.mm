@@ -286,6 +286,10 @@ void PerfLogThread() {
       ms[i] = double(now.nanoseconds[i] - before.nanoseconds[i]) / 1e6 / frames;
     }
     const double submits = double(now.calls[0] - before.calls[0]);
+    double recorded[rex::ui::kGpuCallKinds];
+    for (int i = 3; i < rex::ui::kGpuCallKinds; ++i) {
+      recorded[i] = double(now.calls[i] - before.calls[i]) / frames;
+    }
     before = now;
 
     std::vector<Usage> usage;
@@ -326,6 +330,9 @@ void PerfLogThread() {
            "acquire %.1f ms; thermal %ld; %d threads, cpu %d%%: %s\n",
            elapsed, presents / kSeconds, submits / frames, ms[0], ms[1], ms[2],
            (long)NSProcessInfo.processInfo.thermalState, int(thread_count), total / 10, top.c_str());
+    printf("[mcla-perf]        per frame: %.0f render passes, %.0f draws, %.0f buffer copies, %.0f texture "
+           "uploads, %.0f dispatches, %.0f barriers, %.0f pipeline binds\n",
+           recorded[3], recorded[4], recorded[5], recorded[6], recorded[7], recorded[8], recorded[9]);
     if (profile && presents > 0) {
       std::vector<ProfileTarget> targets;
       const pthread_t self = pthread_self();
