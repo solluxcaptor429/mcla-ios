@@ -162,10 +162,10 @@ index 5f0afef..bb6b8d8 100644
  #endif
 diff --git a/include/rex/ui/app_background.h b/include/rex/ui/app_background.h
 new file mode 100644
-index 0000000..c08877c
+index 0000000..e4ef172
 --- /dev/null
 +++ b/include/rex/ui/app_background.h
-@@ -0,0 +1,39 @@
+@@ -0,0 +1,44 @@
 +/**
 + * @file        rex/ui/app_background.h
 + * @brief       Holding GPU work while an iOS app is in the background
@@ -202,14 +202,19 @@ index 0000000..c08877c
 +  unsigned long long nanoseconds[kGpuCallKinds];
 +};
 +void AddGpuCall(int kind, unsigned long long nanoseconds);
++
++// How far the creation of the stored pipelines at start has got, for a front
++// end to show (total 0: not started; done == total: finished).
++void SetStartupProgress(unsigned long long done, unsigned long long total);
++void GetStartupProgress(unsigned long long* done, unsigned long long* total);
 +GpuCallStats GetGpuCallStats();
 +
 +}  // namespace rex::ui
 diff --git a/src/core/filesystem_posix.cpp b/src/core/filesystem_posix.cpp
-index d3de48a..145b0b5 100644
+index d3de48a..d55c572 100644
 --- a/src/core/filesystem_posix.cpp
 +++ b/src/core/filesystem_posix.cpp
-@@ -100,10 +100,28 @@ std::filesystem::path GetExecutablePath() {
+@@ -100,10 +100,34 @@ std::filesystem::path GetExecutablePath() {
  }
  
  std::filesystem::path GetExecutableFolder() {
@@ -231,8 +236,14 @@ index d3de48a..145b0b5 100644
  std::filesystem::path GetUserFolder() {
 +#if REX_PLATFORM_IOS
 +  // Saves and the shader cache: Library/Application Support in the container.
++  // MCLA_USER_ROOT (Documents/mcla-env.txt): a folder of its own under it, for
++  // unattended test runs that must not touch the player's saves.
 +  if (auto home = rex::platform::env::get("HOME")) {
-+    return std::filesystem::path(*home) / "Library" / "Application Support";
++    auto folder = std::filesystem::path(*home) / "Library" / "Application Support";
++    if (auto root = rex::platform::env::get("MCLA_USER_ROOT"); root && !root->empty()) {
++      folder /= *root;
++    }
++    return folder;
 +  }
 +#endif
    // get preferred data home
@@ -333,6 +344,69 @@ index a910d57..660ae53 100644
      add_library(rexgpu-xenos STATIC ${REXGPU_XENOS_SOURCES})
  else()
      add_library(rexgpu-xenos SHARED ${REXGPU_XENOS_SOURCES})
+diff --git a/src/graphics/shader_storage_progress.h b/src/graphics/shader_storage_progress.h
+index f570dce..67481df 100644
+--- a/src/graphics/shader_storage_progress.h
++++ b/src/graphics/shader_storage_progress.h
+@@ -27,6 +27,10 @@
+ #endif
+ 
+ #include <rex/cvar.h>
++#include <rex/platform.h>
++#if REX_PLATFORM_IOS
++#include <rex/ui/app_background.h>
++#endif
+ 
+ REXCVAR_DECLARE(int32_t, shader_storage_progress);
+ 
+@@ -41,6 +45,13 @@ class ShaderStorageProgress {
+                       ? size_t(REXCVAR_GET(shader_storage_progress))
+                       : 0),
+         start_(std::chrono::steady_clock::now()) {
++#if REX_PLATFORM_IOS
++    // The app shows it over its black first screen (ios_support.mm).
++    report_ = print && total_ != 0;
++    if (report_) {
++      rex::ui::SetStartupProgress(0, total_);
++    }
++#endif
+     if (interval_) {
+       std::lock_guard<std::mutex> lock(print_lock_);
+       std::fprintf(stdout, "SHADERPREP preload 0 %zu\n", total_);
+@@ -54,6 +65,11 @@ class ShaderStorageProgress {
+       created_.fetch_add(1, std::memory_order_relaxed);
+     }
+     const size_t done = done_.fetch_add(1, std::memory_order_relaxed) + 1;
++#if REX_PLATFORM_IOS
++    if (report_) {
++      rex::ui::SetStartupProgress(done < total_ ? done : total_ - 1, total_);
++    }
++#endif
+     if (interval_ && done % interval_ == 0 && done < total_) {
+       std::lock_guard<std::mutex> lock(print_lock_);
+       std::fprintf(stdout, "SHADERPREP preload %zu %zu\n", done, total_);
+@@ -62,6 +78,11 @@ class ShaderStorageProgress {
+   }
+ 
+   void Finish() {
++#if REX_PLATFORM_IOS
++    if (report_) {
++      rex::ui::SetStartupProgress(total_, total_);
++    }
++#endif
+     if (interval_) {
+       const long long ms = std::chrono::duration_cast<std::chrono::milliseconds>(
+                                std::chrono::steady_clock::now() - start_)
+@@ -79,6 +100,9 @@ class ShaderStorageProgress {
+   std::atomic<size_t> done_{0};
+   std::atomic<size_t> created_{0};
+   std::mutex print_lock_;
++#if REX_PLATFORM_IOS
++  bool report_ = false;
++#endif
+ };
+ 
+ // A JSON string literal of text (ShaderStorageReport).
 diff --git a/src/system/CMakeLists.txt b/src/system/CMakeLists.txt
 index 6231b65..da8c4de 100644
 --- a/src/system/CMakeLists.txt
@@ -420,10 +494,10 @@ index e1695f8..e7559f2 100644
      image_decode.cpp
 diff --git a/src/ui/app_background.cpp b/src/ui/app_background.cpp
 new file mode 100644
-index 0000000..4bbcb11
+index 0000000..f674696
 --- /dev/null
 +++ b/src/ui/app_background.cpp
-@@ -0,0 +1,68 @@
+@@ -0,0 +1,81 @@
 +/**
 + * @file        ui/app_background.cpp
 + * @brief       Holding GPU work while an iOS app is in the background
@@ -480,6 +554,19 @@ index 0000000..4bbcb11
 +void AddGpuCall(int kind, unsigned long long nanoseconds) {
 +  g_gpu_calls[kind].fetch_add(1, std::memory_order_relaxed);
 +  g_gpu_nanoseconds[kind].fetch_add(nanoseconds, std::memory_order_relaxed);
++}
++
++std::atomic<unsigned long long> g_startup_done{0};
++std::atomic<unsigned long long> g_startup_total{0};
++
++void SetStartupProgress(unsigned long long done, unsigned long long total) {
++  g_startup_done.store(done, std::memory_order_relaxed);
++  g_startup_total.store(total, std::memory_order_relaxed);
++}
++
++void GetStartupProgress(unsigned long long* done, unsigned long long* total) {
++  *done = g_startup_done.load(std::memory_order_relaxed);
++  *total = g_startup_total.load(std::memory_order_relaxed);
 +}
 +
 +GpuCallStats GetGpuCallStats() {

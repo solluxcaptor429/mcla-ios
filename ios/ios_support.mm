@@ -5,12 +5,14 @@
 // trace in Documents (the Files app shows it under "On My iPhone > MCLA").
 
 #import <Foundation/Foundation.h>
+#import <UIKit/UIKit.h>
 
 #include <os/proc.h>
 #include <stdio.h>
 #include <stdlib.h>
 #include <string.h>
 #include <sys/sysctl.h>
+#include <time.h>
 #include <unistd.h>
 
 #include <iterator>
@@ -93,6 +95,25 @@ __attribute__((constructor(101))) void MclaIosEarlyInit() {
       NSString* value = [line substringFromIndex:equals.location + 1];
       setenv(name.UTF8String, value.UTF8String, 1);
       printf("[mcla-ios] mcla-env.txt: %s=%s\n", name.UTF8String, value.UTF8String);
+    }
+
+    // A test run's own user folder (MCLA_USER_ROOT), made from the player's
+    // the first time: the saves and the shader storage, never written back.
+    if (const char* user_root = getenv("MCLA_USER_ROOT"); user_root && user_root[0]) {
+      NSString* support = [NSHomeDirectory() stringByAppendingPathComponent:@"Library/Application Support"];
+      NSString* root = [support stringByAppendingPathComponent:@(user_root)];
+      NSString* copy = [root stringByAppendingPathComponent:@"mcla"];
+      NSFileManager* manager = [NSFileManager defaultManager];
+      if (![manager fileExistsAtPath:copy]) {
+        [manager createDirectoryAtPath:root withIntermediateDirectories:YES attributes:nil error:nil];
+        NSError* error = nil;
+        const BOOL copied = [manager copyItemAtPath:[support stringByAppendingPathComponent:@"mcla"]
+                                             toPath:copy
+                                              error:&error];
+        printf("[mcla-ios] test user folder %s: %s\n", user_root,
+               copied ? "copied from the player's" : error.localizedDescription.UTF8String);
+      }
+      printf("[mcla-ios] user folder: Library/Application Support/%s (test run, no save sync)\n", user_root);
     }
 
     // Sound with the ring switch off, as a game console would play it; no home
@@ -256,6 +277,58 @@ void ProfileThreads(const std::vector<ProfileTarget>& targets) {
   }
 }
 
+// "Preparing shaders 812 / 1578" over the black screen while the stored
+// pipelines are created at start (a minute or two the first time, seconds
+// after): without it the app looks hung.
+void ShowStartupProgress() {
+  static UILabel* label = nil;
+  static dispatch_source_t timer = nil;
+  timer = dispatch_source_create(DISPATCH_SOURCE_TYPE_TIMER, 0, 0, dispatch_get_main_queue());
+  dispatch_source_set_timer(timer, dispatch_time(DISPATCH_TIME_NOW, NSEC_PER_SEC / 2), NSEC_PER_SEC / 4,
+                            NSEC_PER_SEC / 20);
+  dispatch_source_set_event_handler(timer, ^{
+    unsigned long long done = 0, total = 0;
+    rex::ui::GetStartupProgress(&done, &total);
+    const bool busy = total != 0 && done < total;
+    if (busy) {
+      if (!label) {
+        UIWindow* window = nil;
+        for (UIScene* scene in UIApplication.sharedApplication.connectedScenes) {
+          if ([scene isKindOfClass:[UIWindowScene class]]) {
+            UIWindowScene* window_scene = (UIWindowScene*)scene;
+            window = window_scene.keyWindow ?: window_scene.windows.firstObject;
+            if (window) {
+              break;
+            }
+          }
+        }
+        if (!window) {
+          return;
+        }
+        label = [[UILabel alloc] initWithFrame:window.bounds];
+        label.autoresizingMask = UIViewAutoresizingFlexibleWidth | UIViewAutoresizingFlexibleHeight;
+        label.textAlignment = NSTextAlignmentCenter;
+        label.textColor = UIColor.whiteColor;
+        label.backgroundColor = UIColor.blackColor;
+        label.numberOfLines = 2;
+        label.font = [UIFont monospacedDigitSystemFontOfSize:20 weight:UIFontWeightMedium];
+        label.userInteractionEnabled = NO;
+        [window addSubview:label];
+      }
+      [label.superview bringSubviewToFront:label];
+      label.text = [NSString stringWithFormat:@"Preparing shaders\n%llu / %llu", done, total];
+    } else if (label) {
+      [label removeFromSuperview];
+      label = nil;
+    }
+    if (total != 0 && done >= total && timer) {
+      dispatch_source_cancel(timer);
+      timer = nil;
+    }
+  });
+  dispatch_resume(timer);
+}
+
 // A line every five seconds while the game is in front: frames presented a
 // second, what the Vulkan calls that hand work to Metal cost a frame, the
 // phone's thermal state, and the threads that use the most CPU. It is what
@@ -326,9 +399,12 @@ void PerfLogThread() {
                (usage[i].permille % 100000) / 10);
       top += item;
     }
-    printf("[mcla-perf] %4ds  %.1f fps, %.1f submits/frame; per frame: submit %.1f ms, present %.1f ms, "
+    char clock[16] = "";
+    const time_t wall = time(nullptr);
+    strftime(clock, sizeof(clock), "%H:%M:%S", localtime(&wall));
+    printf("[mcla-perf] %s %4ds  %.1f fps, %.1f submits/frame; per frame: submit %.1f ms, present %.1f ms, "
            "acquire %.1f ms; thermal %ld; %d threads, cpu %d%%: %s\n",
-           elapsed, presents / kSeconds, submits / frames, ms[0], ms[1], ms[2],
+           clock, elapsed, presents / kSeconds, submits / frames, ms[0], ms[1], ms[2],
            (long)NSProcessInfo.processInfo.thermalState, int(thread_count), total / 10, top.c_str());
     printf("[mcla-perf]        per frame: %.0f render passes, %.0f draws, %.0f buffer copies, %.0f texture "
            "uploads, %.0f dispatches, %.0f barriers, %.0f pipeline binds\n",
@@ -399,6 +475,7 @@ extern "C" void MclaIosApplyDeviceDefaults(void) {
   rex::cvar::SetFlagFromCommandLine("edram_tiles", edram_tiles ? edram_tiles : "2048");
 
   std::thread(PerfLogThread).detach();
+  ShowStartupProgress();
 
   printf("[mcla-ios] device class: %s (%s)\n", large ? "M-class iPad" : "phone-class", machine);
   for (size_t i = 0; i < count; ++i) {

@@ -13,6 +13,7 @@
 #import <UIKit/UIKit.h>
 
 #include <stdio.h>
+#include <stdlib.h>
 
 #if MCLA_HAVE_SYNC
 #include "libmclasync.h"
@@ -83,6 +84,9 @@ extern "C" void MclaIosApplyDeviceDefaults(void);  // ios_support.mm
 
 extern "C" void rex_ios_before_app(void) {
   MclaIosApplyDeviceDefaults();
+  if (const char* user_root = getenv("MCLA_USER_ROOT"); user_root && user_root[0]) {
+    return;
+  }
 #if MCLA_HAVE_SYNC
   @autoreleasepool {
     NSString* home = NSHomeDirectory();
