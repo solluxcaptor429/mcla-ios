@@ -216,16 +216,27 @@ index 0000000..c0174f1
 +
 +}  // namespace rex::ui
 diff --git a/src/core/exception_handler_posix.cpp b/src/core/exception_handler_posix.cpp
-index 8b1c76a..6bf72e9 100644
+index 8b1c76a..4048927 100644
 --- a/src/core/exception_handler_posix.cpp
 +++ b/src/core/exception_handler_posix.cpp
-@@ -31,8 +31,59 @@
+@@ -31,8 +31,70 @@
  
  #include <ucontext.h>
  
 +#if REX_PLATFORM_IOS
-+#include <dlfcn.h>
 +#include <cstdio>
++
++// dladdr, declared here: this file asks for an XSI feature level (for
++// <ucontext.h>), under which <dlfcn.h> leaves it and Dl_info out.
++extern "C" {
++struct RexDlInfo {
++  const char* dli_fname;
++  void* dli_fbase;
++  const char* dli_sname;
++  void* dli_saddr;
++};
++int dladdr(const void* address, RexDlInfo* info);
++}
 +#endif
 +
  namespace rex::arch {
@@ -259,7 +270,7 @@ index 8b1c76a..6bf72e9 100644
 +    fp = next;
 +  }
 +  for (int i = 0; i < count; ++i) {
-+    Dl_info info;
++    RexDlInfo info;
 +    if (dladdr(reinterpret_cast<void*>(frames[i]), &info) && info.dli_fname) {
 +      const char* image = std::strrchr(info.dli_fname, '/');
 +      image = image ? image + 1 : info.dli_fname;
@@ -279,7 +290,7 @@ index 8b1c76a..6bf72e9 100644
  bool signal_handlers_installed_ = false;
  struct sigaction original_sigill_handler_;
  struct sigaction original_sigsegv_handler_;
-@@ -417,6 +468,12 @@ static void ExceptionHandlerCallback(int signal_number, siginfo_t* signal_info,
+@@ -417,6 +479,12 @@ static void ExceptionHandlerCallback(int signal_number, siginfo_t* signal_info,
        return;
      }
    }
