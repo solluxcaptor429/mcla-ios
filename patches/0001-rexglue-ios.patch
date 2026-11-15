@@ -962,7 +962,7 @@ index f1722de..fbeec7a 100644
                upload_ranges_.emplace_back(run_first, page - run_first);
                g_shared_memory_hot_uploaded_bytes.fetch_add(run_end - run_start,
 diff --git a/src/graphics/vulkan/command_processor.cpp b/src/graphics/vulkan/command_processor.cpp
-index cbced76..8c70ab9 100644
+index cbced76..e45f872 100644
 --- a/src/graphics/vulkan/command_processor.cpp
 +++ b/src/graphics/vulkan/command_processor.cpp
 @@ -30,6 +30,7 @@
@@ -1041,7 +1041,20 @@ index cbced76..8c70ab9 100644
  }
  
  void VulkanCommandProcessor::SubmitBarriersAndEnterRenderTargetCacheRenderPass(
-@@ -4039,6 +4071,8 @@ void VulkanCommandProcessor::SubmitBarriersAndEnterRenderTargetCacheRenderPass(
+@@ -4023,10 +4055,12 @@ void VulkanCommandProcessor::SubmitBarriersAndEnterRenderTargetCacheRenderPass(
+   if (use_dynamic_rendering) {
+     if (in_render_pass_ && current_framebuffer_ == framebuffer &&
+         current_render_pass_ == VK_NULL_HANDLE) {
++      ExpandRenderArea(VkRect2D{{0, 0}, render_area_host_extent_});
+       return;
+     }
+   } else {
+     if (current_render_pass_ == render_pass && current_framebuffer_ == framebuffer) {
++      ExpandRenderArea(VkRect2D{{0, 0}, render_area_host_extent_});
+       return;
+     }
+   }
+@@ -4039,6 +4073,8 @@ void VulkanCommandProcessor::SubmitBarriersAndEnterRenderTargetCacheRenderPass(
      }
      in_render_pass_ = false;
      hoist_render_pass_ = false;
@@ -1050,7 +1063,7 @@ index cbced76..8c70ab9 100644
    }
  
    current_render_pass_ = use_dynamic_rendering ? VK_NULL_HANDLE : render_pass;
-@@ -4107,9 +4141,12 @@ void VulkanCommandProcessor::SubmitBarriersAndEnterRenderTargetCacheRenderPass(
+@@ -4107,9 +4143,12 @@ void VulkanCommandProcessor::SubmitBarriersAndEnterRenderTargetCacheRenderPass(
  
  void VulkanCommandProcessor::EndRenderPass() {
    assert_true(submission_open_);
@@ -1063,7 +1076,7 @@ index cbced76..8c70ab9 100644
    if (current_render_pass_ == VK_NULL_HANDLE) {
      deferred_command_buffer_.CmdVkEndRendering();
    } else {
-@@ -4119,6 +4156,52 @@ void VulkanCommandProcessor::EndRenderPass() {
+@@ -4119,6 +4158,48 @@ void VulkanCommandProcessor::EndRenderPass() {
    current_framebuffer_ = nullptr;
    in_render_pass_ = false;
    hoist_render_pass_ = false;
@@ -1076,10 +1089,6 @@ index cbced76..8c70ab9 100644
 +  render_area_host_extent_ = host_extent;
 +  render_area_max_x_ = 0;
 +  render_area_max_y_ = 0;
-+  // The scissor in effect, if one is: a draw may use it as it is.
-+  if (!dynamic_scissor_update_needed_) {
-+    ExpandRenderArea(dynamic_scissor_);
-+  }
 +}
 +
 +void VulkanCommandProcessor::ExpandRenderArea(const VkRect2D& rect) {
@@ -1116,7 +1125,7 @@ index cbced76..8c70ab9 100644
  }
  
  // Shared memory uploads recorded before the render pass instead of ending it
-@@ -4154,6 +4237,21 @@ bool VulkanCommandProcessor::CanHoistSharedMemoryUpload(
+@@ -4154,6 +4235,21 @@ bool VulkanCommandProcessor::CanHoistSharedMemoryUpload(
    if (!hoist_render_pass_ || !in_render_pass_) {
      return false;
    }
@@ -1138,7 +1147,7 @@ index cbced76..8c70ab9 100644
    for (const std::pair<uint32_t, uint32_t>& range : upload_page_ranges) {
      if (!range.second) {
        continue;
-@@ -4182,11 +4280,160 @@ bool VulkanCommandProcessor::CanHoistSharedMemoryUpload(
+@@ -4182,11 +4278,160 @@ bool VulkanCommandProcessor::CanHoistSharedMemoryUpload(
    return true;
  }
  
@@ -1299,15 +1308,14 @@ index cbced76..8c70ab9 100644
    uint32_t page_size_log2 = shared_memory_->page_size_log2();
    uint32_t page_first = start >> page_size_log2;
    uint32_t page_last = (start + length - 1) >> page_size_log2;
-@@ -4514,6 +4761,7 @@ void VulkanCommandProcessor::SetScissor(const VkRect2D& scissor) {
-     dynamic_scissor_ = scissor;
-     deferred_command_buffer_.CmdVkSetScissor(0, 1, &dynamic_scissor_);
-     dynamic_scissor_update_needed_ = false;
-+    ExpandRenderArea(dynamic_scissor_);
-   }
- }
+@@ -5124,9 +5369,22 @@ bool VulkanCommandProcessor::IssueDraw(xenos::PrimitiveType prim_type, uint32_t
+       render_target_cache_->last_update_render_pass(),
+       render_target_cache_->last_update_framebuffer());
  
-@@ -5127,6 +5375,15 @@ bool VulkanCommandProcessor::IssueDraw(xenos::PrimitiveType prim_type, uint32_t
++  // What this draw can draw to, for the render pass's area
++  // (vulkan_render_area_from_scissor): its scissor, set above.
++  ExpandRenderArea(dynamic_scissor_);
++
    // What this draw reads from the shared memory: no upload into it can go
    // before this render pass any more (CanHoistSharedMemoryUpload).
    if (hoist_render_pass_) {
@@ -1323,7 +1331,7 @@ index cbced76..8c70ab9 100644
      for (const Shader* shader : {static_cast<const Shader*>(vertex_shader),
                                   static_cast<const Shader*>(pixel_shader)}) {
        if (!shader) {
-@@ -5138,9 +5395,51 @@ bool VulkanCommandProcessor::IssueDraw(xenos::PrimitiveType prim_type, uint32_t
+@@ -5138,9 +5396,51 @@ bool VulkanCommandProcessor::IssueDraw(xenos::PrimitiveType prim_type, uint32_t
          uint32_t j;
          while (rex::bit_scan_forward(vfetch_bits_remaining, &j)) {
            vfetch_bits_remaining &= ~(uint32_t(1) << j);
@@ -1378,7 +1386,7 @@ index cbced76..8c70ab9 100644
          }
        }
      }
-@@ -6186,6 +6485,7 @@ bool VulkanCommandProcessor::HostOcclusionQueryBegin() {
+@@ -6186,6 +6486,7 @@ bool VulkanCommandProcessor::HostOcclusionQueryBegin() {
  
    // Begun (and ended) outside a render pass: a query begun inside one has to end in the same
    // subpass. The draws of the render passes in between are counted all the same.
@@ -1386,7 +1394,7 @@ index cbced76..8c70ab9 100644
    EndRenderPass();
  
    DeferredCommandBuffer& command_buffer = deferred_command_buffer();
-@@ -6207,6 +6507,7 @@ void VulkanCommandProcessor::HostOcclusionQueryAbandon() {
+@@ -6207,6 +6508,7 @@ void VulkanCommandProcessor::HostOcclusionQueryAbandon() {
    active_occlusion_query_ = {};
    // A query is recording only while its submission is open (the end of the submission ends it).
    if (occlusion_query_pool_ != VK_NULL_HANDLE && submission_open_) {
@@ -1394,7 +1402,7 @@ index cbced76..8c70ab9 100644
      EndRenderPass();
      deferred_command_buffer_.CmdVkEndQuery(occlusion_query_pool_, host_index);
    }
-@@ -6226,6 +6527,7 @@ bool VulkanCommandProcessor::HostOcclusionQueryEnd(uint32_t& host_index_out,
+@@ -6226,6 +6528,7 @@ bool VulkanCommandProcessor::HostOcclusionQueryEnd(uint32_t& host_index_out,
      return false;
    }
  
@@ -1402,7 +1410,7 @@ index cbced76..8c70ab9 100644
    EndRenderPass();
  
    // The count is copied to the readback buffer in the same command buffer (the copy waits for the
-@@ -6564,6 +6866,7 @@ bool VulkanCommandProcessor::BeginSubmission(bool is_guest_command) {
+@@ -6564,6 +6867,7 @@ bool VulkanCommandProcessor::BeginSubmission(bool is_guest_command) {
      current_framebuffer_ = nullptr;
      in_render_pass_ = false;
      hoist_render_pass_ = false;
@@ -1410,7 +1418,7 @@ index cbced76..8c70ab9 100644
      current_guest_graphics_pipeline_ = VK_NULL_HANDLE;
      current_external_graphics_pipeline_ = VK_NULL_HANDLE;
      current_external_compute_pipeline_ = VK_NULL_HANDLE;
-@@ -6724,12 +7027,14 @@ bool VulkanCommandProcessor::EndSubmission(bool is_swap) {
+@@ -6724,12 +7028,14 @@ bool VulkanCommandProcessor::EndSubmission(bool is_swap) {
  
      if (active_occlusion_query_.valid && occlusion_query_pool_ != VK_NULL_HANDLE) {
        // Begun outside a render pass, so it ends outside one (the guest's end then finds it cut).
