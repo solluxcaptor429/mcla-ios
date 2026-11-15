@@ -162,10 +162,10 @@ index 5f0afef..bb6b8d8 100644
  #endif
 diff --git a/include/rex/ui/app_background.h b/include/rex/ui/app_background.h
 new file mode 100644
-index 0000000..e4ef172
+index 0000000..c0174f1
 --- /dev/null
 +++ b/include/rex/ui/app_background.h
-@@ -0,0 +1,44 @@
+@@ -0,0 +1,49 @@
 +/**
 + * @file        rex/ui/app_background.h
 + * @brief       Holding GPU work while an iOS app is in the background
@@ -207,6 +207,11 @@ index 0000000..e4ef172
 +// end to show (total 0: not started; done == total: finished).
 +void SetStartupProgress(unsigned long long done, unsigned long long total);
 +void GetStartupProgress(unsigned long long* done, unsigned long long* total);
++
++// Pad buttons (X_INPUT_GAMEPAD_* bits) held on the app's own on-screen
++// controls: the input driver adds them to the state of the pad it reports.
++void SetExtraPadButtons(unsigned buttons);
++unsigned GetExtraPadButtons();
 +GpuCallStats GetGpuCallStats();
 +
 +}  // namespace rex::ui
@@ -503,6 +508,40 @@ index f570dce..67481df 100644
  };
  
  // A JSON string literal of text (ShaderStorageReport).
+diff --git a/src/input/sdl/sdl_input_driver.cpp b/src/input/sdl/sdl_input_driver.cpp
+index c7c440d..c7d5b65 100644
+--- a/src/input/sdl/sdl_input_driver.cpp
++++ b/src/input/sdl/sdl_input_driver.cpp
+@@ -18,6 +18,8 @@
+ #include <rex/input/flags.h>
+ #include <rex/input/sdl/sdl_input_driver.h>
+ #include <rex/logging.h>
++#include <rex/platform.h>
++#include <rex/ui/app_background.h>
+ #include <rex/ui/virtual_key.h>
+ 
+ REXCVAR_DEFINE_STRING(hid_mappings_file, "gamecontrollerdb.txt", "Input",
+@@ -221,6 +223,20 @@ X_RESULT SDLInputDriver::GetDeviceState(DeviceId id, X_INPUT_STATE* out_state) {
+     // pressed buttons aren't lost and will be visible again.
+     std::memset(&out_state->gamepad, 0, sizeof(out_state->gamepad));
+   }
++#if REX_PLATFORM_IOS
++  else {
++    // Start and Back of the app's on-screen controls (the system's virtual
++    // controller has neither).
++    static uint16_t last_extra = 0;
++    const uint16_t extra = static_cast<uint16_t>(rex::ui::GetExtraPadButtons());
++    if (extra != last_extra) {
++      last_extra = extra;
++      controller->state.packet_number++;
++      out_state->packet_number = controller->state.packet_number;
++    }
++    out_state->gamepad.buttons = out_state->gamepad.buttons | extra;
++  }
++#endif
+   return X_ERROR_SUCCESS;
+ }
+ 
 diff --git a/src/system/CMakeLists.txt b/src/system/CMakeLists.txt
 index 6231b65..da8c4de 100644
 --- a/src/system/CMakeLists.txt
@@ -590,10 +629,10 @@ index e1695f8..e7559f2 100644
      image_decode.cpp
 diff --git a/src/ui/app_background.cpp b/src/ui/app_background.cpp
 new file mode 100644
-index 0000000..f674696
+index 0000000..154852d
 --- /dev/null
 +++ b/src/ui/app_background.cpp
-@@ -0,0 +1,81 @@
+@@ -0,0 +1,91 @@
 +/**
 + * @file        ui/app_background.cpp
 + * @brief       Holding GPU work while an iOS app is in the background
@@ -663,6 +702,16 @@ index 0000000..f674696
 +void GetStartupProgress(unsigned long long* done, unsigned long long* total) {
 +  *done = g_startup_done.load(std::memory_order_relaxed);
 +  *total = g_startup_total.load(std::memory_order_relaxed);
++}
++
++std::atomic<unsigned> g_extra_pad_buttons{0};
++
++void SetExtraPadButtons(unsigned buttons) {
++  g_extra_pad_buttons.store(buttons, std::memory_order_relaxed);
++}
++
++unsigned GetExtraPadButtons() {
++  return g_extra_pad_buttons.load(std::memory_order_relaxed);
 +}
 +
 +GpuCallStats GetGpuCallStats() {

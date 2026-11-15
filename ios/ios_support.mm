@@ -30,6 +30,10 @@
 #include <rex/cvar.h>
 #include <rex/ui/app_background.h>
 
+extern "C" bool MclaIosMetalStatsInstall(void);                      // ios_metal_stats.mm
+extern "C" bool MclaIosMetalStatsRead(unsigned long long* counts);  // ios_metal_stats.mm
+extern "C" void MclaIosStartTouchControls(void);                    // ios_touch.mm
+
 namespace {
 
 __attribute__((constructor(101))) void MclaIosEarlyInit() {
@@ -344,6 +348,8 @@ void PerfLogThread() {
   const char* profile_setting = getenv("MCLA_PROFILE");
   const bool profile = profile_setting && profile_setting[0] == '1';
   rex::ui::GpuCallStats before = rex::ui::GetGpuCallStats();
+  unsigned long long metal_before[8] = {};
+  MclaIosMetalStatsRead(metal_before);
   const int kSeconds = 5;
   for (int elapsed = kSeconds;; elapsed += kSeconds) {
     sleep(kSeconds);
@@ -409,6 +415,17 @@ void PerfLogThread() {
     printf("[mcla-perf]        per frame: %.0f render passes, %.0f draws, %.0f buffer copies, %.0f texture "
            "uploads, %.0f dispatches, %.0f barriers, %.0f pipeline binds\n",
            recorded[3], recorded[4], recorded[5], recorded[6], recorded[7], recorded[8], recorded[9]);
+    unsigned long long metal_now[8] = {};
+    if (MclaIosMetalStatsRead(metal_now)) {
+      double metal[8];
+      for (int i = 0; i < 8; ++i) {
+        metal[i] = double(metal_now[i] - metal_before[i]) / frames;
+        metal_before[i] = metal_now[i];
+      }
+      printf("[mcla-perf]        Metal per frame: %.1f render passes (%.1f load nothing, %.1f multisampled), "
+             "%.2f M samples loaded, %.2f M stored, %.1f compute passes, %.1f blit passes, %.1f command buffers\n",
+             metal[0], metal[5], metal[7], metal[3] / 1e6, metal[4] / 1e6, metal[1], metal[2], metal[6]);
+    }
     if (profile && presents > 0) {
       std::vector<ProfileTarget> targets;
       const pthread_t self = pthread_self();
@@ -460,8 +477,14 @@ extern "C" void MclaIosApplyDeviceDefaults(void) {
     const char* name;
     const char* value;
   };
-  const Default large_defaults[] = {{"resolution_scale", "2"}, {"mcla_fps", "60"}};
-  const Default small_defaults[] = {{"resolution_scale", "1"}};
+  // Measured on an iPhone 17 Pro Max (2026-11-15): the GPU is the limit, and
+  // the game's own "low" preset (no anti-aliasing, no full-screen blur, the
+  // environment map every 4th frame) took the city from 7-12 to 20-26 frames a
+  // second. Until the renderer suits a tile-based GPU better, every device
+  // starts with it at the console's resolution; the pause menu's PERFORMANCE
+  // tab and mcla.toml change it.
+  const Default large_defaults[] = {{"resolution_scale", "1"}, {"mcla_preset", "low"}};
+  const Default small_defaults[] = {{"resolution_scale", "1"}, {"mcla_preset", "low"}};
   const Default* defaults = large ? large_defaults : small_defaults;
   const size_t count = large ? std::size(large_defaults) : std::size(small_defaults);
 
@@ -474,8 +497,10 @@ extern "C" void MclaIosApplyDeviceDefaults(void) {
   const char* edram_tiles = getenv("MCLA_EDRAM_TILES");
   rex::cvar::SetFlagFromCommandLine("edram_tiles", edram_tiles ? edram_tiles : "2048");
 
+  MclaIosMetalStatsInstall();
   std::thread(PerfLogThread).detach();
   ShowStartupProgress();
+  MclaIosStartTouchControls();
 
   printf("[mcla-ios] device class: %s (%s)\n", large ? "M-class iPad" : "phone-class", machine);
   for (size_t i = 0; i < count; ++i) {

@@ -102,7 +102,9 @@ set(MCLA_SYNC_LIB "" CACHE FILEPATH "libmclasync.a (empty: no save sync)")
 add_executable(mcla MACOSX_BUNDLE
     ${MCLA_HOST_SOURCES}
     ios_support.mm
-    ios_sync.mm)
+    ios_sync.mm
+    ios_touch.mm
+    ios_metal_stats.mm)
 target_include_directories(mcla PRIVATE
     "${MCLA_FORK_DIR}"
     "${MCLA_FORK_DIR}/src"
@@ -110,7 +112,7 @@ target_include_directories(mcla PRIVATE
     "${CMAKE_CURRENT_BINARY_DIR}/include")
 target_include_directories(mcla SYSTEM PRIVATE ${MCLA_SDK_THIRDPARTY_INCLUDES})
 target_compile_options(mcla PRIVATE -fno-strict-aliasing -fno-char8_t -ffp-contract=off)
-set_source_files_properties(ios_support.mm ios_sync.mm PROPERTIES COMPILE_OPTIONS "-fobjc-arc")
+set_source_files_properties(ios_support.mm ios_sync.mm ios_touch.mm ios_metal_stats.mm PROPERTIES COMPILE_OPTIONS "-fobjc-arc")
 if(MCLA_SYNC_LIB)
     get_filename_component(_mcla_sync_dir "${MCLA_SYNC_LIB}" DIRECTORY)
     target_compile_definitions(mcla PRIVATE MCLA_HAVE_SYNC=1)
