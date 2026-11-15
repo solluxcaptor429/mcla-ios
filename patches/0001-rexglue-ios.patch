@@ -94,6 +94,65 @@ index f455b00..3739faa 100644
          _rexglue_stage_macos_vulkan_runtime(${target_name})
      endif()
  endfunction()
+diff --git a/include/rex/graphics/vulkan/command_processor.h b/include/rex/graphics/vulkan/command_processor.h
+index b91f605..00bd549 100644
+--- a/include/rex/graphics/vulkan/command_processor.h
++++ b/include/rex/graphics/vulkan/command_processor.h
+@@ -288,6 +288,13 @@ class VulkanCommandProcessor : public CommandProcessor {
+   void BindExternalComputePipeline(VkPipeline pipeline);
+   void SetViewport(const VkViewport& viewport);
+   void SetScissor(const VkRect2D& scissor);
++  // Why the next EndRenderPass ends the render pass, for the statistics
++  // (rex/ui/app_background.h, kinds 10 on); it then goes back to "other".
++  void SetPassEndReason(int reason) { pass_end_reason_ = reason; }
++  // What is drawn to in the current render pass other than through the
++  // scissor (a vkCmdClearAttachments rectangle), for
++  // vulkan_render_area_from_scissor.
++  void ExpandRenderArea(const VkRect2D& rect);
+ 
+   // Returns the text to display in the GPU backend name in the window title.
+   std::string GetWindowTitleText() const;
+@@ -1137,6 +1144,19 @@ class VulkanCommandProcessor : public CommandProcessor {
+   VkRenderPass current_render_pass_;
+   const VulkanRenderTargetCache::Framebuffer* current_framebuffer_;
+   bool in_render_pass_ = false;
++  int pass_end_reason_ = 16;
++
++  // The render area of the current render pass from the scissors used in it
++  // (vulkan_render_area_from_scissor): the pass is begun with the whole
++  // framebuffer as its area, and when it ends the begin is given the extent
++  // that the scissors set in it reached.
++  bool render_area_tracked_ = false;
++  size_t render_area_begin_point_ = 0;
++  VkExtent2D render_area_host_extent_{};
++  uint32_t render_area_max_x_ = 0;
++  uint32_t render_area_max_y_ = 0;
++  void BeginRenderAreaTracking(size_t begin_point, VkExtent2D host_extent);
++  void FinishRenderAreaTracking();
+ 
+   // Upload hoisting (CanHoistSharedMemoryUpload): whether the current render
+   // pass takes hoisted commands, its hoist point in the deferred command
+diff --git a/include/rex/graphics/vulkan/deferred_command_buffer.h b/include/rex/graphics/vulkan/deferred_command_buffer.h
+index 81aab6c..ef7be55 100644
+--- a/include/rex/graphics/vulkan/deferred_command_buffer.h
++++ b/include/rex/graphics/vulkan/deferred_command_buffer.h
+@@ -71,6 +71,16 @@ class DeferredCommandBuffer {
+   // CmdHoistPoint to its current end.
+   void ExtendHoistPoint(size_t hoist_point);
+ 
++  // Where the next command of the main stream will be written, and whether
++  // the main stream is the one being written: of a render pass begin (either
++  // kind) about to be written, for SetRenderAreaExtent.
++  size_t NextCommandPoint() const { return command_stream_.size(); }
++  bool IsWritingMainStream() const { return write_stream_ == &command_stream_; }
++  // Sets the extent of the render area of the render pass begin written at
++  // point (its offset stays 0, 0): what the pass turned out to draw to is
++  // known only when it ends.
++  void SetRenderAreaExtent(size_t point, VkExtent2D extent);
++
+   // render_pass_begin->pNext of all barriers must be null.
+   void CmdVkBeginRenderPass(const VkRenderPassBeginInfo* render_pass_begin,
+                             VkSubpassContents contents) {
 diff --git a/include/rex/graphics/vulkan/pipeline_cache.h b/include/rex/graphics/vulkan/pipeline_cache.h
 index 49c1a07..9df616d 100644
 --- a/include/rex/graphics/vulkan/pipeline_cache.h
@@ -162,10 +221,10 @@ index 5f0afef..bb6b8d8 100644
  #endif
 diff --git a/include/rex/ui/app_background.h b/include/rex/ui/app_background.h
 new file mode 100644
-index 0000000..c0174f1
+index 0000000..0c7618c
 --- /dev/null
 +++ b/include/rex/ui/app_background.h
-@@ -0,0 +1,49 @@
+@@ -0,0 +1,54 @@
 +/**
 + * @file        rex/ui/app_background.h
 + * @brief       Holding GPU work while an iOS app is in the background
@@ -195,8 +254,13 @@ index 0000000..c0174f1
 +// vkQueueSubmit (0), vkQueuePresentKHR (1) and vkAcquireNextImageKHR (2) so far,
 +// and calls only of what is recorded into command buffers: render passes begun
 +// (3), draws (4), buffer copies (5), buffer-to-image copies (6), compute
-+// dispatches (7), pipeline barriers (8) and pipeline binds (9).
-+constexpr int kGpuCallKinds = 10;
++// dispatches (7), pipeline barriers (8) and pipeline binds (9); and why the
++// render passes of the guest's drawing were ended: a shared memory upload that
++// could not go before the pass (10), the texture cache (11), the render target
++// cache's resolves and dumps (12), an occlusion query's begin or end (13), the
++// end of a submission (14), another render target or a transfer (15),
++// anything else that asked for it (16), barriers pending at a draw (17).
++constexpr int kGpuCallKinds = 18;
 +struct GpuCallStats {
 +  unsigned long long calls[kGpuCallKinds];
 +  unsigned long long nanoseconds[kGpuCallKinds];
@@ -519,6 +583,366 @@ index f570dce..67481df 100644
  };
  
  // A JSON string literal of text (ShaderStorageReport).
+diff --git a/src/graphics/vulkan/command_processor.cpp b/src/graphics/vulkan/command_processor.cpp
+index cbced76..ea13465 100644
+--- a/src/graphics/vulkan/command_processor.cpp
++++ b/src/graphics/vulkan/command_processor.cpp
+@@ -30,6 +30,7 @@
+ #include <rex/cvar.h>
+ #include <rex/dbg.h>
+ #include <rex/logging.h>
++#include <rex/ui/app_background.h>
+ #include <rex/math.h>
+ #include <rex/graphics/util/draw.h>
+ #include <rex/graphics/flags.h>
+@@ -84,6 +85,14 @@ REXCVAR_DEFINE_BOOL(vulkan_hoist_shared_memory_uploads, true, "GPU/Vulkan",
+                     "instead of ending the render pass for every upload")
+     .lifecycle(rex::cvar::Lifecycle::kHotReload);
+ 
++REXCVAR_DEFINE_BOOL(vulkan_render_area_from_scissor, false, "GPU/Vulkan",
++                    "Give each render pass of the guest's drawing the area its scissors cover "
++                    "instead of the whole host render target, which is as wide as the surface's "
++                    "pitch and up to render_target_max_height tall. A tile-based GPU (Apple's, "
++                    "through MoltenVK) loads and stores every tile of the area for each pass: a "
++                    "320x180 pass in a 320x1024 target moved 5.7 times the memory it drew to")
++    .lifecycle(rex::cvar::Lifecycle::kHotReload);
++
+ REXCVAR_DEFINE_BOOL(vulkan_dynamic_rendering, true, "GPU/Vulkan",
+                     "Use VK_KHR_dynamic_rendering for Vulkan GPU emulation when supported by the "
+                     "device (falls back to render passes otherwise)")
+@@ -3902,6 +3911,9 @@ bool VulkanCommandProcessor::SubmitBarriers(bool force_end_render_pass) {
+     }
+     return false;
+   }
++  if (pass_end_reason_ == 16) {
++    pass_end_reason_ = 17;
++  }
+   EndRenderPass();
+   for (auto it = pending_barriers_.cbegin(); it != pending_barriers_.cend(); ++it) {
+     auto it_next = std::next(it);
+@@ -3956,6 +3968,8 @@ void VulkanCommandProcessor::SubmitBarriersAndEnterRenderTargetCacheRenderPass(
+     }
+     in_render_pass_ = false;
+     hoist_render_pass_ = false;
++    FinishRenderAreaTracking();
++    rex::ui::AddGpuCall(15, 0);
+   }
+ 
+   current_render_pass_ = use_dynamic_rendering ? VK_NULL_HANDLE : render_pass;
+@@ -3969,6 +3983,10 @@ void VulkanCommandProcessor::SubmitBarriersAndEnterRenderTargetCacheRenderPass(
+     hoist_render_pass_ = true;
+   }
+ 
++  const bool track_render_area = REXCVAR_GET(vulkan_render_area_from_scissor) &&
++                                 deferred_command_buffer_.IsWritingMainStream();
++  const size_t render_area_begin_point = deferred_command_buffer_.NextCommandPoint();
++
+   if (use_dynamic_rendering) {
+     VkRenderingAttachmentInfo color_attachments[xenos::kMaxColorRenderTargets];
+     VkRenderingAttachmentInfo depth_attachment;
+@@ -4010,6 +4028,9 @@ void VulkanCommandProcessor::SubmitBarriersAndEnterRenderTargetCacheRenderPass(
+                                                   VK_SUBPASS_CONTENTS_INLINE);
+   }
+   in_render_pass_ = true;
++  if (track_render_area) {
++    BeginRenderAreaTracking(render_area_begin_point, framebuffer->host_extent);
++  }
+ }
+ 
+ void VulkanCommandProcessor::SubmitBarriersAndEnterRenderTargetCacheRenderPass(
+@@ -4039,6 +4060,8 @@ void VulkanCommandProcessor::SubmitBarriersAndEnterRenderTargetCacheRenderPass(
+     }
+     in_render_pass_ = false;
+     hoist_render_pass_ = false;
++    FinishRenderAreaTracking();
++    rex::ui::AddGpuCall(15, 0);
+   }
+ 
+   current_render_pass_ = use_dynamic_rendering ? VK_NULL_HANDLE : render_pass;
+@@ -4107,9 +4130,12 @@ void VulkanCommandProcessor::SubmitBarriersAndEnterRenderTargetCacheRenderPass(
+ 
+ void VulkanCommandProcessor::EndRenderPass() {
+   assert_true(submission_open_);
++  const int pass_end_reason = pass_end_reason_;
++  pass_end_reason_ = 16;
+   if (!in_render_pass_) {
+     return;
+   }
++  rex::ui::AddGpuCall(pass_end_reason, 0);
+   if (current_render_pass_ == VK_NULL_HANDLE) {
+     deferred_command_buffer_.CmdVkEndRendering();
+   } else {
+@@ -4119,6 +4145,52 @@ void VulkanCommandProcessor::EndRenderPass() {
+   current_framebuffer_ = nullptr;
+   in_render_pass_ = false;
+   hoist_render_pass_ = false;
++  FinishRenderAreaTracking();
++}
++
++void VulkanCommandProcessor::BeginRenderAreaTracking(size_t begin_point, VkExtent2D host_extent) {
++  render_area_tracked_ = true;
++  render_area_begin_point_ = begin_point;
++  render_area_host_extent_ = host_extent;
++  render_area_max_x_ = 0;
++  render_area_max_y_ = 0;
++  // The scissor in effect, if one is: a draw may use it as it is.
++  if (!dynamic_scissor_update_needed_) {
++    ExpandRenderArea(dynamic_scissor_);
++  }
++}
++
++void VulkanCommandProcessor::ExpandRenderArea(const VkRect2D& rect) {
++  if (!render_area_tracked_) {
++    return;
++  }
++  const int64_t right = int64_t(rect.offset.x) + rect.extent.width;
++  const int64_t bottom = int64_t(rect.offset.y) + rect.extent.height;
++  if (right > int64_t(render_area_max_x_)) {
++    render_area_max_x_ = uint32_t(std::min(right, int64_t(UINT32_MAX)));
++  }
++  if (bottom > int64_t(render_area_max_y_)) {
++    render_area_max_y_ = uint32_t(std::min(bottom, int64_t(UINT32_MAX)));
++  }
++}
++
++void VulkanCommandProcessor::FinishRenderAreaTracking() {
++  if (!render_area_tracked_) {
++    return;
++  }
++  render_area_tracked_ = false;
++  // No scissor seen: nothing is known about what was drawn to.
++  if (!render_area_max_x_ || !render_area_max_y_) {
++    return;
++  }
++  VkExtent2D extent;
++  extent.width = std::min(render_area_max_x_, render_area_host_extent_.width);
++  extent.height = std::min(render_area_max_y_, render_area_host_extent_.height);
++  if (extent.width == render_area_host_extent_.width &&
++      extent.height == render_area_host_extent_.height) {
++    return;
++  }
++  deferred_command_buffer_.SetRenderAreaExtent(render_area_begin_point_, extent);
+ }
+ 
+ // Shared memory uploads recorded before the render pass instead of ending it
+@@ -4514,6 +4586,7 @@ void VulkanCommandProcessor::SetScissor(const VkRect2D& scissor) {
+     dynamic_scissor_ = scissor;
+     deferred_command_buffer_.CmdVkSetScissor(0, 1, &dynamic_scissor_);
+     dynamic_scissor_update_needed_ = false;
++    ExpandRenderArea(dynamic_scissor_);
+   }
+ }
+ 
+@@ -6186,6 +6259,7 @@ bool VulkanCommandProcessor::HostOcclusionQueryBegin() {
+ 
+   // Begun (and ended) outside a render pass: a query begun inside one has to end in the same
+   // subpass. The draws of the render passes in between are counted all the same.
++  pass_end_reason_ = 13;
+   EndRenderPass();
+ 
+   DeferredCommandBuffer& command_buffer = deferred_command_buffer();
+@@ -6207,6 +6281,7 @@ void VulkanCommandProcessor::HostOcclusionQueryAbandon() {
+   active_occlusion_query_ = {};
+   // A query is recording only while its submission is open (the end of the submission ends it).
+   if (occlusion_query_pool_ != VK_NULL_HANDLE && submission_open_) {
++    pass_end_reason_ = 13;
+     EndRenderPass();
+     deferred_command_buffer_.CmdVkEndQuery(occlusion_query_pool_, host_index);
+   }
+@@ -6226,6 +6301,7 @@ bool VulkanCommandProcessor::HostOcclusionQueryEnd(uint32_t& host_index_out,
+     return false;
+   }
+ 
++  pass_end_reason_ = 13;
+   EndRenderPass();
+ 
+   // The count is copied to the readback buffer in the same command buffer (the copy waits for the
+@@ -6564,6 +6640,7 @@ bool VulkanCommandProcessor::BeginSubmission(bool is_guest_command) {
+     current_framebuffer_ = nullptr;
+     in_render_pass_ = false;
+     hoist_render_pass_ = false;
++    render_area_tracked_ = false;
+     current_guest_graphics_pipeline_ = VK_NULL_HANDLE;
+     current_external_graphics_pipeline_ = VK_NULL_HANDLE;
+     current_external_compute_pipeline_ = VK_NULL_HANDLE;
+@@ -6724,12 +6801,14 @@ bool VulkanCommandProcessor::EndSubmission(bool is_swap) {
+ 
+     if (active_occlusion_query_.valid && occlusion_query_pool_ != VK_NULL_HANDLE) {
+       // Begun outside a render pass, so it ends outside one (the guest's end then finds it cut).
++      pass_end_reason_ = 14;
+       EndRenderPass();
+       deferred_command_buffer_.CmdVkEndQuery(occlusion_query_pool_,
+                                              active_occlusion_query_.host_index);
+       active_occlusion_query_ = {};
+     }
+ 
++    pass_end_reason_ = 14;
+     EndRenderPass();
+ 
+     pipeline_cache_->EndSubmission();
+diff --git a/src/graphics/vulkan/deferred_command_buffer.cpp b/src/graphics/vulkan/deferred_command_buffer.cpp
+index 4a71f37..9350e8b 100644
+--- a/src/graphics/vulkan/deferred_command_buffer.cpp
++++ b/src/graphics/vulkan/deferred_command_buffer.cpp
+@@ -43,6 +43,26 @@ size_t DeferredCommandBuffer::CmdHoistPoint() {
+   return size_t(reinterpret_cast<const uintmax_t*>(&args) - command_stream_.data());
+ }
+ 
++void DeferredCommandBuffer::SetRenderAreaExtent(size_t point, VkExtent2D extent) {
++  if (point + kCommandHeaderSizeElements > command_stream_.size()) {
++    assert_always();
++    return;
++  }
++  const CommandHeader& header = *reinterpret_cast<const CommandHeader*>(command_stream_.data() + point);
++  void* arguments = command_stream_.data() + (point + kCommandHeaderSizeElements);
++  switch (header.command) {
++    case Command::kVkBeginRenderPass:
++      reinterpret_cast<ArgsVkBeginRenderPass*>(arguments)->render_area.extent = extent;
++      break;
++    case Command::kVkBeginRendering:
++      reinterpret_cast<ArgsVkBeginRendering*>(arguments)->render_area.extent = extent;
++      break;
++    default:
++      assert_unhandled_case(header.command);
++      break;
++  }
++}
++
+ void DeferredCommandBuffer::ExtendHoistPoint(size_t hoist_point) {
+   assert_true(hoist_point < command_stream_.size());
+   auto& args = *reinterpret_cast<ArgsHoistedCommands*>(command_stream_.data() + hoist_point);
+diff --git a/src/graphics/vulkan/render_target_cache.cpp b/src/graphics/vulkan/render_target_cache.cpp
+index 0a03c6b..35f4ed4 100644
+--- a/src/graphics/vulkan/render_target_cache.cpp
++++ b/src/graphics/vulkan/render_target_cache.cpp
+@@ -1836,6 +1836,7 @@ bool VulkanRenderTargetCache::Resolve(const memory::Memory& memory,
+                 copy_pipeline_layout, VK_SHADER_STAGE_COMPUTE_BIT, copy_shader_constants_size,
+                 sizeof(direct_source_constants), &direct_source_constants);
+           }
++          command_processor_.SetPassEndReason(12);
+           command_processor_.SubmitBarriers(true);
+           command_buffer.CmdVkDispatch(copy_group_count_x, copy_group_count_y, 1);
+ 
+@@ -1895,6 +1896,7 @@ bool VulkanRenderTargetCache::Resolve(const memory::Memory& memory,
+           command_buffer.CmdVkPushConstants(resolve_fsi_clear_pipeline_layout_,
+                                             VK_SHADER_STAGE_COMPUTE_BIT, 0,
+                                             sizeof(depth_clear_constants), &depth_clear_constants);
++          command_processor_.SetPassEndReason(12);
+           command_processor_.SubmitBarriers(true);
+           command_buffer.CmdVkDispatch(clear_group_count.first, clear_group_count.second, 1);
+         }
+@@ -1915,6 +1917,7 @@ bool VulkanRenderTargetCache::Resolve(const memory::Memory& memory,
+                 resolve_fsi_clear_pipeline_layout_, VK_SHADER_STAGE_COMPUTE_BIT, 0,
+                 sizeof(color_clear_constants), &color_clear_constants);
+           }
++          command_processor_.SetPassEndReason(12);
+           command_processor_.SubmitBarriers(true);
+           command_buffer.CmdVkDispatch(clear_group_count.first, clear_group_count.second, 1);
+         }
+@@ -2029,6 +2032,7 @@ bool VulkanRenderTargetCache::HdrCopyColorTarget(uint32_t key, VkImageView dest,
+       rt->current_layout(), VK_IMAGE_LAYOUT_SHADER_READ_ONLY_OPTIMAL);
+   rt->SetUsage(VK_PIPELINE_STAGE_COMPUTE_SHADER_BIT, VK_ACCESS_SHADER_READ_BIT,
+                VK_IMAGE_LAYOUT_SHADER_READ_ONLY_OPTIMAL);
++  command_processor_.SetPassEndReason(12);
+   command_processor_.SubmitBarriers(true);
+   DeferredCommandBuffer& command_buffer = command_processor_.deferred_command_buffer();
+   command_processor_.BindExternalComputePipeline(pipeline);
+@@ -2093,6 +2097,7 @@ bool VulkanRenderTargetCache::HdrClearColorTarget(uint32_t key, VkRect2D rect) {
+   VkClearAttachment attachment = {};
+   attachment.aspectMask = VK_IMAGE_ASPECT_COLOR_BIT;
+   VkClearRect clear_rect = {rect, 0, 1};
++  command_processor_.ExpandRenderArea(rect);
+   command_processor_.deferred_command_buffer().CmdVkClearAttachments(1, &attachment, 1,
+                                                                      &clear_rect);
+   return true;
+@@ -5534,6 +5539,7 @@ void VulkanRenderTargetCache::PerformTransfersAndResolveClears(
+             host_depth_store_pipeline_layout_, VK_SHADER_STAGE_COMPUTE_BIT,
+             uint32_t(offsetof(HostDepthStoreConstants, rectangle)),
+             sizeof(host_depth_store_rectangle_constant), &host_depth_store_rectangle_constant);
++        command_processor_.SetPassEndReason(12);
+         command_processor_.SubmitBarriers(true);
+         command_buffer.CmdVkDispatch(group_count_x, group_count_y, 1);
+         MarkEdramBufferModified();
+@@ -6293,6 +6299,7 @@ void VulkanRenderTargetCache::PerformTransfersAndResolveClears(
+                       color_resolve_clear_host_value, sizeof(float) * 4);
+         }
+       }
++      command_processor_.ExpandRenderArea(resolve_clear_rect.rect);
+       command_buffer.CmdVkClearAttachments(1, &resolve_clear_attachment, 1, &resolve_clear_rect);
+     }
+   }
+@@ -7075,6 +7082,7 @@ bool VulkanRenderTargetCache::DumpRenderTargets(uint32_t dump_base, uint32_t dum
+                                           sizeof(uint32_t) * kDumpPushConstantOffsets,
+                                           sizeof(last_offsets), &last_offsets);
+       }
++      command_processor_.SetPassEndReason(12);
+       command_processor_.SubmitBarriers(true);
+       command_buffer.CmdVkDispatch(
+           (draw_resolution_scale_x() *
+diff --git a/src/graphics/vulkan/shared_memory.cpp b/src/graphics/vulkan/shared_memory.cpp
+index ebc998e..cfede5f 100644
+--- a/src/graphics/vulkan/shared_memory.cpp
++++ b/src/graphics/vulkan/shared_memory.cpp
+@@ -288,6 +288,7 @@ bool VulkanSharedMemory::UploadByteRanges(
+   bool hoist = BeginHoistedUpload(hoist_page_ranges_temp_);
+   if (!hoist) {
+     Use(Usage::kTransferDestination, std::make_pair(bounds_start, bounds_end - bounds_start));
++    command_processor_.SetPassEndReason(10);
+     command_processor_.SubmitBarriers(true);
+   }
+   DeferredCommandBuffer& command_buffer = command_processor_.deferred_command_buffer();
+@@ -351,6 +352,7 @@ bool VulkanSharedMemory::UploadRanges(
+                        (upload_page_ranges.back().first + upload_page_ranges.back().second -
+                         upload_page_ranges.front().first)
+                            << page_size_log2()));
++    command_processor_.SetPassEndReason(10);
+     command_processor_.SubmitBarriers(true);
+   }
+   DeferredCommandBuffer& command_buffer = command_processor_.deferred_command_buffer();
+diff --git a/src/graphics/vulkan/texture_cache.cpp b/src/graphics/vulkan/texture_cache.cpp
+index 582b85d..5b3fafe 100644
+--- a/src/graphics/vulkan/texture_cache.cpp
++++ b/src/graphics/vulkan/texture_cache.cpp
+@@ -541,6 +541,7 @@ void VulkanTextureCache::BeginSubmission(uint64_t new_submission_index) {
+           VK_IMAGE_LAYOUT_TRANSFER_DST_OPTIMAL, VK_QUEUE_FAMILY_IGNORED, VK_QUEUE_FAMILY_IGNORED,
+           false);
+     }
++    command_processor_.SetPassEndReason(11);
+     command_processor_.SubmitBarriers(true);
+     DeferredCommandBuffer& command_buffer = command_processor_.deferred_command_buffer();
+     VkClearColorValue null_image_clear_color = kInvalidTextureFetchFallbackColor;
+@@ -1900,6 +1901,7 @@ bool VulkanTextureCache::LoadTextureDataFromResidentMemoryImpl(Texture& texture,
+                                           sizeof(load_constants.host_offset),
+                                           &load_constants.host_offset);
+       }
++      command_processor_.SetPassEndReason(11);
+       command_processor_.SubmitBarriers(true);
+       command_buffer.CmdVkDispatch(group_count_x, group_count_y, load_constants.size_blocks[2]);
+       load_constants.guest_offset += level_array_slice_stride_bytes_scaled;
+@@ -2000,6 +2002,7 @@ bool VulkanTextureCache::LoadTextureDataFromResidentMemoryImpl(Texture& texture,
+                                             sizeof(load_constants_float_convert.host_offset),
+                                             &load_constants_float_convert.host_offset);
+         }
++        command_processor_.SetPassEndReason(11);
+         command_processor_.SubmitBarriers(true);
+         command_buffer.CmdVkDispatch(group_count_x, group_count_y,
+                                      load_constants_float_convert.size_blocks[2]);
+@@ -2073,6 +2076,7 @@ bool VulkanTextureCache::LoadTextureDataFromResidentMemoryImpl(Texture& texture,
+           texture_src_stage_mask, texture_dst_stage_mask, texture_src_access_mask,
+           texture_dst_access_mask, VK_IMAGE_LAYOUT_UNDEFINED, texture_new_layout,
+           VK_QUEUE_FAMILY_IGNORED, VK_QUEUE_FAMILY_IGNORED, false);
++      command_processor_.SetPassEndReason(11);
+       command_processor_.SubmitBarriers(true);
+ 
+       command_processor_.BindExternalComputePipeline(storage_copy_pipeline);
+@@ -2121,6 +2125,7 @@ bool VulkanTextureCache::LoadTextureDataFromResidentMemoryImpl(Texture& texture,
+         texture_src_stage_mask, texture_dst_stage_mask, texture_src_access_mask,
+         texture_dst_access_mask, texture_old_layout, texture_new_layout);
+   }
++  command_processor_.SetPassEndReason(11);
+   command_processor_.SubmitBarriers(true);
+   VkBufferImageCopy* copy_regions = command_buffer.CmdCopyBufferToImageEmplace(
+       scratch_buffer, vulkan_texture.image(), VK_IMAGE_LAYOUT_TRANSFER_DST_OPTIMAL,
 diff --git a/src/input/sdl/sdl_input_driver.cpp b/src/input/sdl/sdl_input_driver.cpp
 index c7c440d..c7d5b65 100644
 --- a/src/input/sdl/sdl_input_driver.cpp

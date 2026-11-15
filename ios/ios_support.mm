@@ -34,6 +34,15 @@ extern "C" bool MclaIosMetalStatsInstall(void);                      // ios_meta
 extern "C" bool MclaIosMetalStatsRead(unsigned long long* counts);  // ios_metal_stats.mm
 extern "C" void MclaIosStartTouchControls(void);                    // ios_touch.mm
 
+// The Vulkan command processor's own counters (rexgpu-xenos, linked in):
+// {submissions, microseconds in them, blocking fence waits, microseconds in
+// those}, and the draws the game issued and the host made of them.
+namespace rex::graphics::vulkan {
+void SubmissionCounters(uint64_t out[4]);
+uint64_t DrawCounter();
+uint64_t HostDrawCounter();
+}  // namespace rex::graphics::vulkan
+
 namespace {
 
 __attribute__((constructor(101))) void MclaIosEarlyInit() {
@@ -350,6 +359,10 @@ void PerfLogThread() {
   rex::ui::GpuCallStats before = rex::ui::GetGpuCallStats();
   unsigned long long metal_before[8] = {};
   MclaIosMetalStatsRead(metal_before);
+  uint64_t waits_before[4] = {};
+  rex::graphics::vulkan::SubmissionCounters(waits_before);
+  uint64_t draws_before = rex::graphics::vulkan::DrawCounter();
+  uint64_t host_draws_before = rex::graphics::vulkan::HostDrawCounter();
   const int kSeconds = 5;
   for (int elapsed = kSeconds;; elapsed += kSeconds) {
     sleep(kSeconds);
@@ -415,6 +428,27 @@ void PerfLogThread() {
     printf("[mcla-perf]        per frame: %.0f render passes, %.0f draws, %.0f buffer copies, %.0f texture "
            "uploads, %.0f dispatches, %.0f barriers, %.0f pipeline binds\n",
            recorded[3], recorded[4], recorded[5], recorded[6], recorded[7], recorded[8], recorded[9]);
+    // A blocking wait is the command processor standing still until the GPU
+    // has finished what was submitted: one a frame is the queue's limit (the
+    // GPU is behind), more are readbacks and other synchronous points, which
+    // take the overlap between the two away.
+    uint64_t waits_now[4] = {};
+    rex::graphics::vulkan::SubmissionCounters(waits_now);
+    const uint64_t draws_now = rex::graphics::vulkan::DrawCounter();
+    const uint64_t host_draws_now = rex::graphics::vulkan::HostDrawCounter();
+    printf("[mcla-perf]        GPU waits per frame: %.2f blocking (%.1f ms); %.0f guest draws, %.0f host draws\n",
+           double(waits_now[2] - waits_before[2]) / frames,
+           double(waits_now[3] - waits_before[3]) / 1e3 / frames, double(draws_now - draws_before) / frames,
+           double(host_draws_now - host_draws_before) / frames);
+    for (int i = 0; i < 4; ++i) {
+      waits_before[i] = waits_now[i];
+    }
+    draws_before = draws_now;
+    host_draws_before = host_draws_now;
+    printf("[mcla-perf]        pass ends per frame: %.1f uploads, %.1f textures, %.1f resolves, %.1f queries, "
+           "%.1f submissions, %.1f target changes, %.1f barriers, %.1f other\n",
+           recorded[10], recorded[11], recorded[12], recorded[13], recorded[14], recorded[15], recorded[17],
+           recorded[16]);
     unsigned long long metal_now[8] = {};
     if (MclaIosMetalStatsRead(metal_now)) {
       double metal[8];
