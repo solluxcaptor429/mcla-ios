@@ -94,6 +94,44 @@ index f455b00..3739faa 100644
          _rexglue_stage_macos_vulkan_runtime(${target_name})
      endif()
  endfunction()
+diff --git a/include/rex/graphics/vulkan/pipeline_cache.h b/include/rex/graphics/vulkan/pipeline_cache.h
+index 49c1a07..9df616d 100644
+--- a/include/rex/graphics/vulkan/pipeline_cache.h
++++ b/include/rex/graphics/vulkan/pipeline_cache.h
+@@ -203,12 +203,22 @@ class VulkanPipelineCache {
+     xenos::StencilOp stencil_front_pass_op : 3;           // 26
+     xenos::StencilOp stencil_front_depth_fail_op : 3;     // 29
+     xenos::CompareFunction stencil_front_compare_op : 3;  // 32
++#if REX_PLATFORM_IOS
++    // The stored descriptions (and the fork's shader pack) have MSVC's layout:
++    // a bit-field that doesn't fit in what is left of its 32-bit unit starts
++    // the next one. Packed, clang would let it straddle and end the bit-fields
++    // after 6 bytes instead of 8: every stored description would fail its hash.
++    uint32_t : 0;
++#endif
+     xenos::StencilOp stencil_back_fail_op : 3;            // 35
+ 
+     xenos::StencilOp stencil_back_pass_op : 3;           // 3
+     xenos::StencilOp stencil_back_depth_fail_op : 3;     // 6
+     xenos::CompareFunction stencil_back_compare_op : 3;  // 9
+     uint32_t sample_rate_shading : 1;                    // 10
++#if REX_PLATFORM_IOS
++    uint32_t ios_msvc_layout_padding_ : 19;
++#endif
+ 
+     // Filled only for the attachments present in the render pass object.
+     PipelineRenderTarget render_targets[xenos::kMaxColorRenderTargets];
+@@ -244,6 +254,10 @@ class VulkanPipelineCache {
+     uint64_t description_hash;
+     PipelineDescription description;
+   });
++  // 8 (hash) + 60: the record of the fbo/fsi .vk.xpso files on every platform.
++#if REX_PLATFORM_IOS || REX_COMPILER_MSVC
++  static_assert(sizeof(PipelineStoredDescription) == 68);
++#endif
+ 
+   struct Pipeline {
+     std::atomic<VkPipeline> pipeline{VK_NULL_HANDLE};
 diff --git a/include/rex/platform.h b/include/rex/platform.h
 index 5f0afef..bb6b8d8 100644
 --- a/include/rex/platform.h
