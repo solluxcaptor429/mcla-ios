@@ -94,6 +94,42 @@ index f455b00..3739faa 100644
          _rexglue_stage_macos_vulkan_runtime(${target_name})
      endif()
  endfunction()
+diff --git a/include/rex/graphics/shared_memory.h b/include/rex/graphics/shared_memory.h
+index c0e8d59..6ba40ca 100644
+--- a/include/rex/graphics/shared_memory.h
++++ b/include/rex/graphics/shared_memory.h
+@@ -13,6 +13,8 @@
+ #include <cstdint>
+ #include <mutex>
+ #include <utility>
++#include <memory>
++#include <unordered_map>
+ #include <vector>
+ 
+ #include <rex/memory.h>
+@@ -190,6 +192,22 @@ class SharedMemory {
+   // The same for the parts of hot pages that a request uses, in bytes, and
+   // the working lists of RequestRanges (kept to avoid allocating per request).
+   std::vector<std::pair<uint32_t, uint32_t>> hot_byte_ranges_;
++
++  // shared_memory_hot_page_compare: what the host buffer holds of the hot
++  // pages, as last uploaded from guest memory, in blocks of 64 bytes (a bit of
++  // valid_blocks each: a page is 64 of them). A hot page is uploaded whenever
++  // a draw asks for it, since nothing says whether the guest wrote it; with
++  // this, only the blocks that differ from what was uploaded last are.
++  struct HotShadowPage {
++    uint64_t valid_blocks = 0;
++    std::unique_ptr<uint8_t[]> data;
++  };
++  std::unordered_map<uint32_t, HotShadowPage> hot_shadow_;
++  // Adds to hot_byte_ranges_ the parts of [byte_start, byte_end) (multiples of
++  // 64) that differ from the shadow, and takes them into it.
++  void AppendChangedHotBytes(uint32_t byte_start, uint32_t byte_end);
++  // The host buffer's pages got other contents than the shadow says.
++  void DropHotShadow(uint32_t page_first, uint32_t page_last);
+   std::vector<std::pair<uint32_t, uint32_t>> request_merged_ranges_;
+   std::vector<std::pair<uint32_t, uint32_t>> request_asked_ranges_;
+ 
 diff --git a/include/rex/graphics/vulkan/command_processor.h b/include/rex/graphics/vulkan/command_processor.h
 index b91f605..00bd549 100644
 --- a/include/rex/graphics/vulkan/command_processor.h
@@ -583,6 +619,140 @@ index f570dce..67481df 100644
  };
  
  // A JSON string literal of text (ShaderStorageReport).
+diff --git a/src/graphics/shared_memory.cpp b/src/graphics/shared_memory.cpp
+index f1722de..d32f56e 100644
+--- a/src/graphics/shared_memory.cpp
++++ b/src/graphics/shared_memory.cpp
+@@ -40,6 +40,13 @@ REXCVAR_DEFINE_UINT32(shared_memory_hot_page_faults, 0, "GPU",
+ REXCVAR_DEFINE_UINT32(shared_memory_hot_page_exact, 1, "GPU",
+                       "1: of a hot page, upload only the bytes a draw asks for (where the "
+                       "graphics backend can); 0: the whole page");
++REXCVAR_DEFINE_BOOL(shared_memory_hot_page_compare, false, "GPU",
++                    "Of a hot page, upload only the 64-byte blocks that differ from what was "
++                    "uploaded last (a copy of it is kept): a buffer the game fills once and "
++                    "draws from many times is otherwise uploaded for every one of those draws, "
++                    "and on Vulkan an upload of bytes a draw of the render pass has read ends "
++                    "the render pass. Needs shared_memory_hot_page_exact")
++    .lifecycle(rex::cvar::Lifecycle::kHotReload);
+ REXCVAR_DEFINE_UINT32(shared_memory_hot_page_ms, 2000, "GPU",
+                       "How long a hot page stays hot before it is watched again");
+ REXCVAR_DEFINE_BOOL(shared_memory_request_fast_path, true, "GPU",
+@@ -162,6 +169,7 @@ void SharedMemory::ShutdownCommon() {
+ 
+ void SharedMemory::InvalidateAllPages() {
+   auto global_lock = global_critical_region_.Acquire();
++  hot_shadow_.clear();
+ 
+   std::fill(system_page_flags_valid_.begin(), system_page_flags_valid_.end(), uint64_t(0));
+   std::fill(system_page_flags_valid_and_gpu_written_.begin(),
+@@ -177,6 +185,7 @@ void SharedMemory::SetSystemPageBlocksValidWithGpuDataWritten() {
+ }
+ 
+ void SharedMemory::ClearCache() {
++  hot_shadow_.clear();
+   // Keeping GPU-written data, so "invalidated by GPU".
+   FireWatches(0, (kBufferSize - 1) >> page_size_log2_, true);
+   // No watches now, so no references to the pools accessible by guest threads -
+@@ -347,6 +356,66 @@ void SharedMemory::FireWatches(uint32_t page_first, uint32_t page_last, bool inv
+   }
+ }
+ 
++void SharedMemory::AppendChangedHotBytes(uint32_t byte_start, uint32_t byte_end) {
++  // A cap on the copies kept (64 MiB of them): start over rather than grow.
++  if (hot_shadow_.size() > 16384) {
++    hot_shadow_.clear();
++  }
++  uint32_t run_start = UINT32_MAX;
++  HotShadowPage* shadow = nullptr;
++  uint32_t shadow_page = UINT32_MAX;
++  for (uint32_t address = byte_start; address < byte_end; address += 64) {
++    const uint32_t page = address >> 12;
++    if (page != shadow_page) {
++      shadow_page = page;
++      shadow = &hot_shadow_[page];
++      if (!shadow->data) {
++        shadow->data.reset(new uint8_t[4096]);
++        shadow->valid_blocks = 0;
++      }
++    }
++    const uint32_t block = (address & 4095) >> 6;
++    const uint64_t block_bit = uint64_t(1) << block;
++    uint8_t* const kept = shadow->data.get() + (block << 6);
++    const uint8_t* const guest = memory_.TranslatePhysical(address);
++    const bool same = (shadow->valid_blocks & block_bit) && std::memcmp(kept, guest, 64) == 0;
++    if (same) {
++      if (run_start != UINT32_MAX) {
++        hot_byte_ranges_.emplace_back(run_start, address - run_start);
++        run_start = UINT32_MAX;
++      }
++      continue;
++    }
++    std::memcpy(kept, guest, 64);
++    shadow->valid_blocks |= block_bit;
++    if (run_start == UINT32_MAX) {
++      run_start = address;
++    }
++  }
++  if (run_start != UINT32_MAX) {
++    hot_byte_ranges_.emplace_back(run_start, byte_end - run_start);
++  }
++}
++
++void SharedMemory::DropHotShadow(uint32_t page_first, uint32_t page_last) {
++  if (hot_shadow_.empty()) {
++    return;
++  }
++  if (page_last - page_first >= hot_shadow_.size()) {
++    for (auto it = hot_shadow_.begin(); it != hot_shadow_.end();) {
++      if (it->first >= page_first && it->first <= page_last) {
++        it = hot_shadow_.erase(it);
++      } else {
++        ++it;
++      }
++    }
++    return;
++  }
++  for (uint32_t page = page_first; page <= page_last; ++page) {
++    hot_shadow_.erase(page);
++  }
++}
++
+ void SharedMemory::RangeWrittenByGpu(uint32_t start, uint32_t length) {
+   if (length == 0 || start >= kBufferSize) {
+     return;
+@@ -356,6 +425,9 @@ void SharedMemory::RangeWrittenByGpu(uint32_t start, uint32_t length) {
+   uint32_t page_first = start >> page_size_log2_;
+   uint32_t page_last = end >> page_size_log2_;
+ 
++  // The GPU's own data is in these pages of the host buffer now.
++  DropHotShadow(page_first, page_last);
++
+   // Trigger modification callbacks so, for instance, resolved data is loaded to
+   // the texture.
+   FireWatches(page_first, page_last, true);
+@@ -608,6 +680,9 @@ bool SharedMemory::RequestRanges(const std::pair<uint32_t, uint32_t>* ranges, si
+           uint64_t(1) << page_size_log2_, std::memory_order_relaxed);
+       page_state_[page] = kPageUploaded;
+     }
++    // The whole pages go up from guest memory: the shadow of an earlier hot
++    // time of theirs is out of date.
++    DropHotShadow(page_start, page_start + page_count - 1);
+     if (!upload_ranges_.empty()) {
+       std::pair<uint32_t, uint32_t>& last_upload_range = upload_ranges_.back();
+       if (last_upload_range.first + last_upload_range.second == page_start) {
+@@ -700,7 +775,11 @@ bool SharedMemory::RequestRanges(const std::pair<uint32_t, uint32_t>* ranges, si
+               // Only what is used, to 64-byte boundaries (a page is a multiple).
+               const uint32_t byte_start = uint32_t(asked_start) & ~uint32_t(63);
+               const uint32_t byte_end = uint32_t((asked_end + 63) & ~uint64_t(63));
+-              hot_byte_ranges_.emplace_back(byte_start, byte_end - byte_start);
++              if (REXCVAR_GET(shared_memory_hot_page_compare) && page_size_log2_ == 12) {
++                AppendChangedHotBytes(byte_start, byte_end);
++              } else {
++                hot_byte_ranges_.emplace_back(byte_start, byte_end - byte_start);
++              }
+             } else {
+               upload_ranges_.emplace_back(run_first, page - run_first);
+               g_shared_memory_hot_uploaded_bytes.fetch_add(run_end - run_start,
 diff --git a/src/graphics/vulkan/command_processor.cpp b/src/graphics/vulkan/command_processor.cpp
 index cbced76..ea13465 100644
 --- a/src/graphics/vulkan/command_processor.cpp
