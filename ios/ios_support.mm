@@ -15,7 +15,16 @@
 
 #include <iterator>
 
+#include <mach/mach.h>
+#include <pthread.h>
+
+#include <algorithm>
+#include <string>
+#include <thread>
+#include <vector>
+
 #include <rex/cvar.h>
+#include <rex/ui/app_background.h>
 
 namespace {
 
@@ -97,6 +106,76 @@ int ModelGeneration(const char* machine, const char* kind) {
   return atoi(machine + length);
 }
 
+// A line every five seconds while the game is in front: frames presented a
+// second, what the Vulkan calls that hand work to Metal cost a frame, the
+// phone's thermal state, and the threads that use the most CPU. It is what
+// says whether a slow game waits on the CPU (one thread near 100%), on the
+// GPU (long presents) or on heat (thermal 2 and up: iOS slows the chip).
+void PerfLogThread() {
+  pthread_setname_np("mcla perf log");
+  struct Usage {
+    std::string name;
+    int permille;
+  };
+  rex::ui::GpuCallStats before = rex::ui::GetGpuCallStats();
+  const int kSeconds = 5;
+  for (int elapsed = kSeconds;; elapsed += kSeconds) {
+    sleep(kSeconds);
+    const rex::ui::GpuCallStats now = rex::ui::GetGpuCallStats();
+    if (rex::ui::IsAppInBackground()) {
+      before = now;
+      continue;
+    }
+    const double presents = double(now.calls[1] - before.calls[1]);
+    const double frames = presents > 0 ? presents : 1;
+    double ms[3];
+    for (int i = 0; i < 3; ++i) {
+      ms[i] = double(now.nanoseconds[i] - before.nanoseconds[i]) / 1e6 / frames;
+    }
+    const double submits = double(now.calls[0] - before.calls[0]);
+    before = now;
+
+    std::vector<Usage> usage;
+    int total = 0;
+    thread_act_array_t threads = nullptr;
+    mach_msg_type_number_t thread_count = 0;
+    if (task_threads(mach_task_self(), &threads, &thread_count) == KERN_SUCCESS) {
+      for (mach_msg_type_number_t i = 0; i < thread_count; ++i) {
+        thread_basic_info_data_t info;
+        mach_msg_type_number_t info_count = THREAD_BASIC_INFO_COUNT;
+        if (thread_info(threads[i], THREAD_BASIC_INFO, reinterpret_cast<thread_info_t>(&info),
+                        &info_count) == KERN_SUCCESS &&
+            !(info.flags & TH_FLAGS_IDLE)) {
+          char name[64] = "";
+          if (pthread_t thread = pthread_from_mach_thread_np(threads[i])) {
+            pthread_getname_np(thread, name, sizeof(name));
+          }
+          total += info.cpu_usage;
+          if (info.cpu_usage >= 30) {
+            usage.push_back({name[0] ? name : "(unnamed)", int(info.cpu_usage)});
+          }
+        }
+        mach_port_deallocate(mach_task_self(), threads[i]);
+      }
+      vm_deallocate(mach_task_self(), reinterpret_cast<vm_address_t>(threads),
+                    thread_count * sizeof(thread_act_t));
+    }
+    std::sort(usage.begin(), usage.end(),
+              [](const Usage& a, const Usage& b) { return a.permille > b.permille; });
+    std::string top;
+    for (size_t i = 0; i < usage.size() && i < 8; ++i) {
+      char item[96];
+      snprintf(item, sizeof(item), "%s%s %d%%", i ? ", " : "", usage[i].name.c_str(),
+               usage[i].permille / 10);
+      top += item;
+    }
+    printf("[mcla-perf] %4ds  %.1f fps, %.1f submits/frame; per frame: submit %.1f ms, present %.1f ms, "
+           "acquire %.1f ms; thermal %ld; %d threads, cpu %d%%: %s\n",
+           elapsed, presents / kSeconds, submits / frames, ms[0], ms[1], ms[2],
+           (long)NSProcessInfo.processInfo.thermalState, int(thread_count), total / 10, top.c_str());
+  }
+}
+
 }  // namespace
 
 // Graphics defaults by device, set before the settings are read: what the
@@ -132,6 +211,15 @@ extern "C" void MclaIosApplyDeviceDefaults(void) {
   const Default small_defaults[] = {{"resolution_scale", "1"}};
   const Default* defaults = large ? large_defaults : small_defaults;
   const size_t count = large ? std::size(large_defaults) : std::size(small_defaults);
+
+  // The fork's PC default, an EDRAM of 4,096 tiles so that the scene is one
+  // tile, left the lower part of the frame as the blur layer on MoltenVK on
+  // the first devices (the part past the console's 2,048 tiles, it seems): the
+  // console's size here, set as the command line would so that the PC default
+  // doesn't replace it.
+  rex::cvar::SetFlagFromCommandLine("edram_tiles", "2048");
+
+  std::thread(PerfLogThread).detach();
 
   printf("[mcla-ios] device class: %s (%s)\n", large ? "M-class iPad" : "phone-class", machine);
   for (size_t i = 0; i < count; ++i) {

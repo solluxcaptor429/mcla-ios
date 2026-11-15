@@ -162,10 +162,10 @@ index 5f0afef..bb6b8d8 100644
  #endif
 diff --git a/include/rex/ui/app_background.h b/include/rex/ui/app_background.h
 new file mode 100644
-index 0000000..f14d1ba
+index 0000000..41341d8
 --- /dev/null
 +++ b/include/rex/ui/app_background.h
-@@ -0,0 +1,26 @@
+@@ -0,0 +1,35 @@
 +/**
 + * @file        rex/ui/app_background.h
 + * @brief       Holding GPU work while an iOS app is in the background
@@ -190,6 +190,15 @@ index 0000000..f14d1ba
 +// Blocks the calling thread while the app is in the background. Returns at
 +// once on the main thread.
 +void WaitWhileAppInBackground();
++
++// What the gated calls cost, for a performance log: calls and nanoseconds in
++// vkQueueSubmit (0), vkQueuePresentKHR (1) and vkAcquireNextImageKHR (2) so far.
++struct GpuCallStats {
++  unsigned long long calls[3];
++  unsigned long long nanoseconds[3];
++};
++void AddGpuCall(int kind, unsigned long long nanoseconds);
++GpuCallStats GetGpuCallStats();
 +
 +}  // namespace rex::ui
 diff --git a/src/core/filesystem_posix.cpp b/src/core/filesystem_posix.cpp
@@ -407,10 +416,10 @@ index e1695f8..e7559f2 100644
      image_decode.cpp
 diff --git a/src/ui/app_background.cpp b/src/ui/app_background.cpp
 new file mode 100644
-index 0000000..47a6da6
+index 0000000..e698ccc
 --- /dev/null
 +++ b/src/ui/app_background.cpp
-@@ -0,0 +1,51 @@
+@@ -0,0 +1,68 @@
 +/**
 + * @file        ui/app_background.cpp
 + * @brief       Holding GPU work while an iOS app is in the background
@@ -461,6 +470,23 @@ index 0000000..47a6da6
 +  g_resumed.wait(lock, [] { return !g_in_background.load(std::memory_order_acquire); });
 +}
 +
++std::atomic<unsigned long long> g_gpu_calls[3];
++std::atomic<unsigned long long> g_gpu_nanoseconds[3];
++
++void AddGpuCall(int kind, unsigned long long nanoseconds) {
++  g_gpu_calls[kind].fetch_add(1, std::memory_order_relaxed);
++  g_gpu_nanoseconds[kind].fetch_add(nanoseconds, std::memory_order_relaxed);
++}
++
++GpuCallStats GetGpuCallStats() {
++  GpuCallStats stats;
++  for (int i = 0; i < 3; ++i) {
++    stats.calls[i] = g_gpu_calls[i].load(std::memory_order_relaxed);
++    stats.nanoseconds[i] = g_gpu_nanoseconds[i].load(std::memory_order_relaxed);
++  }
++  return stats;
++}
++
 +}  // namespace rex::ui
 diff --git a/src/ui/presenter.cpp b/src/ui/presenter.cpp
 index 75d29b1..b01430a 100644
@@ -487,10 +513,18 @@ index 75d29b1..b01430a 100644
    // paint. However, an explicit monitor check is needed because UI framerate
    // limiting may be tied to signals from the OS for the monitor - but painting
 diff --git a/src/ui/vulkan/vulkan_device.cpp b/src/ui/vulkan/vulkan_device.cpp
-index 4918661..80653fb 100644
+index 4918661..40c9312 100644
 --- a/src/ui/vulkan/vulkan_device.cpp
 +++ b/src/ui/vulkan/vulkan_device.cpp
-@@ -25,6 +25,7 @@
+@@ -9,6 +9,7 @@
+  * @modified    Tom Clay, 2026 - Adapted for ReXGlue runtime
+  */
+ 
++#include <chrono>
+ #include <algorithm>
+ #include <cstring>
+ #include <filesystem>
+@@ -25,6 +26,7 @@
  #include <rex/string.h>
  #include <rex/ui/low_latency.h>
  #include <rex/ui/vulkan/device.h>
@@ -498,7 +532,7 @@ index 4918661..80653fb 100644
  
  REXCVAR_DEFINE_BOOL(temporal_aa_device_features, !REX_PLATFORM_PS5, "GPU",
                      "Temporal anti-aliasing: enable the Vulkan device features FSR uses (16-bit "
-@@ -84,6 +85,49 @@ namespace rex {
+@@ -84,6 +86,63 @@ namespace rex {
  namespace ui {
  namespace vulkan {
  
@@ -508,15 +542,28 @@ index 4918661..80653fb 100644
 +PFN_vkQueuePresentKHR g_real_vkQueuePresentKHR = nullptr;
 +PFN_vkAcquireNextImageKHR g_real_vkAcquireNextImageKHR = nullptr;
 +
++struct GpuCallTimer {
++  explicit GpuCallTimer(int kind) : kind_(kind), start_(std::chrono::steady_clock::now()) {}
++  ~GpuCallTimer() {
++    AddGpuCall(kind_, static_cast<unsigned long long>(std::chrono::duration_cast<std::chrono::nanoseconds>(
++                                  std::chrono::steady_clock::now() - start_)
++                                  .count()));
++  }
++  int kind_;
++  std::chrono::steady_clock::time_point start_;
++};
++
 +VKAPI_ATTR VkResult VKAPI_CALL GatedQueueSubmit(VkQueue queue, uint32_t submit_count,
 +                                               const VkSubmitInfo* submits, VkFence fence) {
 +  WaitWhileAppInBackground();
++  GpuCallTimer timer(0);
 +  return g_real_vkQueueSubmit(queue, submit_count, submits, fence);
 +}
 +
 +VKAPI_ATTR VkResult VKAPI_CALL GatedQueuePresentKHR(VkQueue queue,
 +                                                   const VkPresentInfoKHR* present_info) {
 +  WaitWhileAppInBackground();
++  GpuCallTimer timer(1);
 +  return g_real_vkQueuePresentKHR(queue, present_info);
 +}
 +
@@ -524,6 +571,7 @@ index 4918661..80653fb 100644
 +                                                       uint64_t timeout, VkSemaphore semaphore,
 +                                                       VkFence fence, uint32_t* image_index) {
 +  WaitWhileAppInBackground();
++  GpuCallTimer timer(2);
 +  return g_real_vkAcquireNextImageKHR(device, swapchain, timeout, semaphore, fence, image_index);
 +}
 +
@@ -548,7 +596,7 @@ index 4918661..80653fb 100644
  template <typename Structure, VkStructureType StructureType>
  struct VulkanFeatures {
    Structure supported = {StructureType};
-@@ -1069,6 +1113,14 @@ std::unique_ptr<VulkanDevice> VulkanDevice::CreateIfSupported(
+@@ -1069,6 +1128,14 @@ std::unique_ptr<VulkanDevice> VulkanDevice::CreateIfSupported(
  
  #undef XE_UI_VULKAN_FUNCTION
  
