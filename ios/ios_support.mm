@@ -445,6 +445,7 @@ void PerfLogThread() {
     }
     draws_before = draws_now;
     host_draws_before = host_draws_now;
+    printf("[mcla-perf]        %.1f render passes begun per frame by the command processor\n", recorded[18]);
     printf("[mcla-perf]        pass ends per frame: %.1f uploads, %.1f textures, %.1f resolves, %.1f queries, "
            "%.1f submissions, %.1f target changes, %.1f barriers, %.1f other\n",
            recorded[10], recorded[11], recorded[12], recorded[13], recorded[14], recorded[15], recorded[17],
