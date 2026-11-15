@@ -94,8 +94,36 @@ index f455b00..3739faa 100644
          _rexglue_stage_macos_vulkan_runtime(${target_name})
      endif()
  endfunction()
+diff --git a/include/rex/graphics/pipeline/shader/shader.h b/include/rex/graphics/pipeline/shader/shader.h
+index 4cf3854..e67d58a 100644
+--- a/include/rex/graphics/pipeline/shader/shader.h
++++ b/include/rex/graphics/pipeline/shader/shader.h
+@@ -687,6 +687,11 @@ class Shader {
+     uint32_t fetch_constant;
+     // Stride of the entire binding, in words.
+     uint32_t stride_words;
++    // Whether every fetch of the binding takes the vertex index as the shader
++    // was given it (r0.x, not written before, no jumps or loops in the
++    // shader): the words a draw can read from the buffer are then those of the
++    // vertex indices the draw uses, and no others.
++    bool index_is_vertex_index = false;
+     // Packed attributes within the binding buffer.
+     std::vector<Attribute> attributes;
+   };
+@@ -1013,6 +1018,11 @@ class Shader {
+   uint32_t writes_point_size_edge_flag_kill_vertex_ = 0;
+   uint32_t writes_color_targets_ = 0b0000;
+   bool uses_register_dynamic_addressing_ = false;
++  // While analyzing, for VertexBinding::index_is_vertex_index: whether an
++  // instruction so far may have written r0, and whether the last vfetch_full
++  // took the vertex index as given (its vfetch_mini instructions do the same).
++  bool analysis_vertex_index_register_written_ = false;
++  bool analysis_last_vfetch_full_index_is_vertex_index_ = false;
+   bool kills_pixels_ = false;
+   bool uses_texture_fetch_instruction_results_ = false;
+   bool writes_depth_ = false;
 diff --git a/include/rex/graphics/shared_memory.h b/include/rex/graphics/shared_memory.h
-index c0e8d59..6ba40ca 100644
+index c0e8d59..96f184c 100644
 --- a/include/rex/graphics/shared_memory.h
 +++ b/include/rex/graphics/shared_memory.h
 @@ -13,6 +13,8 @@
@@ -107,7 +135,18 @@ index c0e8d59..6ba40ca 100644
  #include <vector>
  
  #include <rex/memory.h>
-@@ -190,6 +192,22 @@ class SharedMemory {
+@@ -79,6 +81,10 @@ class SharedMemory {
+   bool RequestRanges(const std::pair<uint32_t, uint32_t>* ranges, size_t count);
+   bool RequestRange(uint32_t start, uint32_t length);
+ 
++  // Whether a page of the range is hot now (uploaded whenever a draw asks for
++  // it: what such a draw reads is worth knowing exactly).
++  bool IsAnyPageHotInRange(uint32_t start, uint32_t length) const;
++
+   // Marks the range and, if not exact_range, potentially its surroundings
+   // (to up to the first GPU-written page, as an access violation exception
+   // count optimization) as modified by the CPU, also invalidating GPU-written
+@@ -190,6 +196,22 @@ class SharedMemory {
    // The same for the parts of hot pages that a request uses, in bytes, and
    // the working lists of RequestRanges (kept to avoid allocating per request).
    std::vector<std::pair<uint32_t, uint32_t>> hot_byte_ranges_;
@@ -123,7 +162,7 @@ index c0e8d59..6ba40ca 100644
 +  };
 +  std::unordered_map<uint32_t, HotShadowPage> hot_shadow_;
 +  // Adds to hot_byte_ranges_ the parts of [byte_start, byte_end) (multiples of
-+  // 64) that differ from the shadow, and takes them into it.
++  // 64) that differ from the shadow, to 4 bytes, and takes them into it.
 +  void AppendChangedHotBytes(uint32_t byte_start, uint32_t byte_end);
 +  // The host buffer's pages got other contents than the shadow says.
 +  void DropHotShadow(uint32_t page_first, uint32_t page_last);
@@ -131,10 +170,23 @@ index c0e8d59..6ba40ca 100644
    std::vector<std::pair<uint32_t, uint32_t>> request_asked_ranges_;
  
 diff --git a/include/rex/graphics/vulkan/command_processor.h b/include/rex/graphics/vulkan/command_processor.h
-index b91f605..00bd549 100644
+index b91f605..4a26e74 100644
 --- a/include/rex/graphics/vulkan/command_processor.h
 +++ b/include/rex/graphics/vulkan/command_processor.h
-@@ -288,6 +288,13 @@ class VulkanCommandProcessor : public CommandProcessor {
+@@ -240,6 +240,12 @@ class VulkanCommandProcessor : public CommandProcessor {
+       const std::vector<std::pair<uint32_t, uint32_t>>& upload_page_ranges) const;
+   // A new value for every render pass that hoisted commands can go before.
+   uint64_t hoist_render_pass_serial() const { return hoist_render_pass_serial_; }
++  // vulkan_precise_upload_hoisting, as it was when the current render pass
++  // began: what the draws of the pass read is kept in bytes, not in pages.
++  bool hoist_precise() const { return hoist_precise_; }
++  // As CanHoistSharedMemoryUpload, for ranges in bytes (start, length).
++  bool CanHoistSharedMemoryUploadBytes(
++      const std::vector<std::pair<uint32_t, uint32_t>>& upload_byte_ranges) const;
+   // Between these, the deferred command buffer's commands go before the
+   // current render pass.
+   void BeginHoistedCommands() { deferred_command_buffer_.SetWritingHoisted(true); }
+@@ -288,6 +294,13 @@ class VulkanCommandProcessor : public CommandProcessor {
    void BindExternalComputePipeline(VkPipeline pipeline);
    void SetViewport(const VkViewport& viewport);
    void SetScissor(const VkRect2D& scissor);
@@ -148,7 +200,7 @@ index b91f605..00bd549 100644
  
    // Returns the text to display in the GPU backend name in the window title.
    std::string GetWindowTitleText() const;
-@@ -1137,6 +1144,19 @@ class VulkanCommandProcessor : public CommandProcessor {
+@@ -1137,6 +1150,19 @@ class VulkanCommandProcessor : public CommandProcessor {
    VkRenderPass current_render_pass_;
    const VulkanRenderTargetCache::Framebuffer* current_framebuffer_;
    bool in_render_pass_ = false;
@@ -168,6 +220,24 @@ index b91f605..00bd549 100644
  
    // Upload hoisting (CanHoistSharedMemoryUpload): whether the current render
    // pass takes hoisted commands, its hoist point in the deferred command
+@@ -1147,6 +1173,17 @@ class VulkanCommandProcessor : public CommandProcessor {
+   size_t hoist_point_ = 0;
+   uint64_t hoist_render_pass_serial_ = 0;
+   std::vector<uint64_t> hoist_read_pages_;
++  // With vulkan_precise_upload_hoisting: the bytes the draws of the current
++  // render pass may read from the shared memory (start, end), sorted, not
++  // overlapping or touching.
++  bool hoist_precise_ = false;
++  std::vector<std::pair<uint32_t, uint32_t>> hoist_read_intervals_;
++  bool HoistReadOverlaps(uint32_t start, uint32_t end) const;
++  void HoistReadInsert(uint32_t start, uint32_t end);
++  // The first and the last vertex index a draw's vertex shader can be given
++  // (after the base index, the 24-bit mask and the clamp), if they can be told.
++  bool GetDrawVertexIndexRange(const PrimitiveProcessor::ProcessingResult& primitive_processing_result,
++                               uint32_t& first_out, uint32_t& last_out) const;
+   std::vector<uint64_t> hoist_read_pages_serial_;
+ 
+   // Currently bound graphics pipeline, either from the pipeline cache (with
 diff --git a/include/rex/graphics/vulkan/deferred_command_buffer.h b/include/rex/graphics/vulkan/deferred_command_buffer.h
 index 81aab6c..ef7be55 100644
 --- a/include/rex/graphics/vulkan/deferred_command_buffer.h
@@ -227,6 +297,20 @@ index 49c1a07..9df616d 100644
  
    struct Pipeline {
      std::atomic<VkPipeline> pipeline{VK_NULL_HANDLE};
+diff --git a/include/rex/graphics/vulkan/shared_memory.h b/include/rex/graphics/vulkan/shared_memory.h
+index 8a67735..895387c 100644
+--- a/include/rex/graphics/vulkan/shared_memory.h
++++ b/include/rex/graphics/vulkan/shared_memory.h
+@@ -92,6 +92,9 @@ class VulkanSharedMemory : public SharedMemory {
+   uint64_t hoist_render_pass_serial_ = 0;
+   size_t hoist_closing_barrier_offset_ = 0;
+   std::vector<std::pair<uint32_t, uint32_t>> hoist_page_ranges_temp_;
++  // As BeginHoistedUpload, deciding by the byte ranges themselves
++  // (vulkan_precise_upload_hoisting).
++  bool BeginHoistedUploadBytes(const std::vector<std::pair<uint32_t, uint32_t>>& upload_byte_ranges);
+ 
+   std::unique_ptr<ui::vulkan::VulkanUploadBufferPool> upload_buffer_pool_;
+   std::vector<VkBufferCopy> upload_regions_;
 diff --git a/include/rex/platform.h b/include/rex/platform.h
 index 5f0afef..bb6b8d8 100644
 --- a/include/rex/platform.h
@@ -556,6 +640,83 @@ index a910d57..660ae53 100644
      add_library(rexgpu-xenos STATIC ${REXGPU_XENOS_SOURCES})
  else()
      add_library(rexgpu-xenos SHARED ${REXGPU_XENOS_SOURCES})
+diff --git a/src/graphics/pipeline/shader/translator.cpp b/src/graphics/pipeline/shader/translator.cpp
+index e472251..1e2445e 100644
+--- a/src/graphics/pipeline/shader/translator.cpp
++++ b/src/graphics/pipeline/shader/translator.cpp
+@@ -376,6 +376,26 @@ void Shader::GatherVertexFetchInformation(const VertexFetchInstruction& op,
+   }
+   fetch_instr.Disassemble(&ucode_disasm_buffer);
+ 
++  // The index before this instruction's own result is written.
++  bool index_is_vertex_index;
++  if (!fetch_instr.is_mini_fetch) {
++    const InstructionOperand& index_operand = fetch_instr.operands[0];
++    index_is_vertex_index =
++        !analysis_vertex_index_register_written_ && label_addresses_.empty() &&
++        fetch_instr.operand_count >= 1 &&
++        index_operand.storage_source == InstructionStorageSource::kRegister &&
++        index_operand.storage_index == 0 &&
++        index_operand.storage_addressing_mode == InstructionStorageAddressingMode::kAbsolute &&
++        !index_operand.is_negated && !index_operand.is_absolute_value &&
++        index_operand.GetComponent(0) == SwizzleSource::kX &&
++        // Without a stride the index is not used: every vertex reads the
++        // buffer's first element.
++        fetch_instr.attributes.stride != 0;
++    analysis_last_vfetch_full_index_is_vertex_index_ = index_is_vertex_index;
++  } else {
++    index_is_vertex_index = analysis_last_vfetch_full_index_is_vertex_index_;
++  }
++
+   GatherFetchResultInformation(fetch_instr.result);
+ 
+   // Mini-fetches inherit the operands from full fetches.
+@@ -402,6 +422,11 @@ void Shader::GatherVertexFetchInformation(const VertexFetchInstruction& op,
+       // It may not hold that all strides are equal, but I hope it does.
+       assert_true(!fetch_instr.attributes.stride ||
+                   vertex_binding.stride_words == fetch_instr.attributes.stride);
++      if (!index_is_vertex_index ||
++          (fetch_instr.attributes.stride &&
++           vertex_binding.stride_words != fetch_instr.attributes.stride)) {
++        vertex_binding.index_is_vertex_index = false;
++      }
+       vertex_binding.attributes.push_back({});
+       attrib = &vertex_binding.attributes.back();
+       break;
+@@ -413,6 +438,7 @@ void Shader::GatherVertexFetchInformation(const VertexFetchInstruction& op,
+     vertex_binding.binding_index = int(vertex_bindings_.size());
+     vertex_binding.fetch_constant = op.fetch_constant_index();
+     vertex_binding.stride_words = fetch_instr.attributes.stride;
++    vertex_binding.index_is_vertex_index = index_is_vertex_index;
+     vertex_binding.attributes.push_back({});
+     vertex_bindings_.emplace_back(std::move(vertex_binding));
+     attrib = &vertex_bindings_.back().attributes.back();
+@@ -548,8 +574,12 @@ void Shader::GatherFetchResultInformation(const InstructionResult& result) {
+   if (result.storage_addressing_mode == InstructionStorageAddressingMode::kAbsolute) {
+     register_static_address_bound_ =
+         std::max(register_static_address_bound_, result.storage_index + uint32_t(1));
++    if (result.storage_index == 0) {
++      analysis_vertex_index_register_written_ = true;
++    }
+   } else {
+     uses_register_dynamic_addressing_ = true;
++    analysis_vertex_index_register_written_ = true;
+   }
+ }
+ 
+@@ -563,8 +593,12 @@ void Shader::GatherAluResultInformation(const InstructionResult& result, uint32_
+       if (result.storage_addressing_mode == InstructionStorageAddressingMode::kAbsolute) {
+         register_static_address_bound_ =
+             std::max(register_static_address_bound_, result.storage_index + uint32_t(1));
++        if (result.storage_index == 0) {
++          analysis_vertex_index_register_written_ = true;
++        }
+       } else {
+         uses_register_dynamic_addressing_ = true;
++        analysis_vertex_index_register_written_ = true;
+       }
+       break;
+     case InstructionStorageTarget::kInterpolator:
 diff --git a/src/graphics/shader_storage_progress.h b/src/graphics/shader_storage_progress.h
 index f570dce..67481df 100644
 --- a/src/graphics/shader_storage_progress.h
@@ -620,7 +781,7 @@ index f570dce..67481df 100644
  
  // A JSON string literal of text (ShaderStorageReport).
 diff --git a/src/graphics/shared_memory.cpp b/src/graphics/shared_memory.cpp
-index f1722de..d32f56e 100644
+index f1722de..fbeec7a 100644
 --- a/src/graphics/shared_memory.cpp
 +++ b/src/graphics/shared_memory.cpp
 @@ -40,6 +40,13 @@ REXCVAR_DEFINE_UINT32(shared_memory_hot_page_faults, 0, "GPU",
@@ -653,16 +814,40 @@ index f1722de..d32f56e 100644
    // Keeping GPU-written data, so "invalidated by GPU".
    FireWatches(0, (kBufferSize - 1) >> page_size_log2_, true);
    // No watches now, so no references to the pools accessible by guest threads -
-@@ -347,6 +356,66 @@ void SharedMemory::FireWatches(uint32_t page_first, uint32_t page_last, bool inv
+@@ -347,6 +356,113 @@ void SharedMemory::FireWatches(uint32_t page_first, uint32_t page_last, bool inv
    }
  }
  
++bool SharedMemory::IsAnyPageHotInRange(uint32_t start, uint32_t length) const {
++  if (!length || start >= kBufferSize) {
++    return false;
++  }
++  const uint32_t now_ms = uint32_t(rex::chrono::Clock::QueryHostUptimeMillis());
++  if (!AnyPageHot(now_ms)) {
++    return false;
++  }
++  length = std::min(length, kBufferSize - start);
++  const uint32_t page_first = start >> page_size_log2_;
++  const uint32_t page_last = (start + length - 1) >> page_size_log2_;
++  for (uint32_t page = page_first; page <= page_last; ++page) {
++    if (IsPageHot(page, now_ms)) {
++      return true;
++    }
++  }
++  return false;
++}
++
 +void SharedMemory::AppendChangedHotBytes(uint32_t byte_start, uint32_t byte_end) {
 +  // A cap on the copies kept (64 MiB of them): start over rather than grow.
 +  if (hot_shadow_.size() > 16384) {
 +    hot_shadow_.clear();
 +  }
++  // The run of changed bytes being gathered, to 4 bytes (vertex data is in
++  // words): what precedes the first byte that differs and follows the last is
++  // not uploaded, so that an upload does not touch what another draw read
++  // right next to it.
 +  uint32_t run_start = UINT32_MAX;
++  uint32_t run_end = 0;
 +  HotShadowPage* shadow = nullptr;
 +  uint32_t shadow_page = UINT32_MAX;
 +  for (uint32_t address = byte_start; address < byte_end; address += 64) {
@@ -679,22 +864,45 @@ index f1722de..d32f56e 100644
 +    const uint64_t block_bit = uint64_t(1) << block;
 +    uint8_t* const kept = shadow->data.get() + (block << 6);
 +    const uint8_t* const guest = memory_.TranslatePhysical(address);
-+    const bool same = (shadow->valid_blocks & block_bit) && std::memcmp(kept, guest, 64) == 0;
-+    if (same) {
-+      if (run_start != UINT32_MAX) {
-+        hot_byte_ranges_.emplace_back(run_start, address - run_start);
-+        run_start = UINT32_MAX;
++    uint32_t first_different = 0;
++    uint32_t last_different = 63;
++    if (shadow->valid_blocks & block_bit) {
++      while (first_different < 64 && kept[first_different] == guest[first_different]) {
++        ++first_different;
 +      }
-+      continue;
++      if (first_different == 64) {
++        // The block is as it was uploaded.
++        if (run_start != UINT32_MAX) {
++          hot_byte_ranges_.emplace_back(run_start, run_end - run_start);
++          run_start = UINT32_MAX;
++        }
++        continue;
++      }
++      while (last_different > first_different && kept[last_different] == guest[last_different]) {
++        --last_different;
++      }
 +    }
 +    std::memcpy(kept, guest, 64);
 +    shadow->valid_blocks |= block_bit;
++    const uint32_t changed_start = address + (first_different & ~uint32_t(3));
++    const uint32_t changed_end = address + ((last_different + 4) & ~uint32_t(3));
++    if (run_start != UINT32_MAX && first_different >= 4) {
++      // Unchanged bytes between the last block's and this one's: two runs.
++      hot_byte_ranges_.emplace_back(run_start, run_end - run_start);
++      run_start = UINT32_MAX;
++    }
 +    if (run_start == UINT32_MAX) {
-+      run_start = address;
++      run_start = changed_start;
++    }
++    run_end = changed_end;
++    if (last_different < 60) {
++      // Unchanged bytes at the block's end: the run ends here.
++      hot_byte_ranges_.emplace_back(run_start, run_end - run_start);
++      run_start = UINT32_MAX;
 +    }
 +  }
 +  if (run_start != UINT32_MAX) {
-+    hot_byte_ranges_.emplace_back(run_start, byte_end - run_start);
++    hot_byte_ranges_.emplace_back(run_start, run_end - run_start);
 +  }
 +}
 +
@@ -720,7 +928,7 @@ index f1722de..d32f56e 100644
  void SharedMemory::RangeWrittenByGpu(uint32_t start, uint32_t length) {
    if (length == 0 || start >= kBufferSize) {
      return;
-@@ -356,6 +425,9 @@ void SharedMemory::RangeWrittenByGpu(uint32_t start, uint32_t length) {
+@@ -356,6 +472,9 @@ void SharedMemory::RangeWrittenByGpu(uint32_t start, uint32_t length) {
    uint32_t page_first = start >> page_size_log2_;
    uint32_t page_last = end >> page_size_log2_;
  
@@ -730,7 +938,7 @@ index f1722de..d32f56e 100644
    // Trigger modification callbacks so, for instance, resolved data is loaded to
    // the texture.
    FireWatches(page_first, page_last, true);
-@@ -608,6 +680,9 @@ bool SharedMemory::RequestRanges(const std::pair<uint32_t, uint32_t>* ranges, si
+@@ -608,6 +727,9 @@ bool SharedMemory::RequestRanges(const std::pair<uint32_t, uint32_t>* ranges, si
            uint64_t(1) << page_size_log2_, std::memory_order_relaxed);
        page_state_[page] = kPageUploaded;
      }
@@ -740,7 +948,7 @@ index f1722de..d32f56e 100644
      if (!upload_ranges_.empty()) {
        std::pair<uint32_t, uint32_t>& last_upload_range = upload_ranges_.back();
        if (last_upload_range.first + last_upload_range.second == page_start) {
-@@ -700,7 +775,11 @@ bool SharedMemory::RequestRanges(const std::pair<uint32_t, uint32_t>* ranges, si
+@@ -700,7 +822,11 @@ bool SharedMemory::RequestRanges(const std::pair<uint32_t, uint32_t>* ranges, si
                // Only what is used, to 64-byte boundaries (a page is a multiple).
                const uint32_t byte_start = uint32_t(asked_start) & ~uint32_t(63);
                const uint32_t byte_end = uint32_t((asked_end + 63) & ~uint64_t(63));
@@ -754,7 +962,7 @@ index f1722de..d32f56e 100644
                upload_ranges_.emplace_back(run_first, page - run_first);
                g_shared_memory_hot_uploaded_bytes.fetch_add(run_end - run_start,
 diff --git a/src/graphics/vulkan/command_processor.cpp b/src/graphics/vulkan/command_processor.cpp
-index cbced76..ea13465 100644
+index cbced76..8c70ab9 100644
 --- a/src/graphics/vulkan/command_processor.cpp
 +++ b/src/graphics/vulkan/command_processor.cpp
 @@ -30,6 +30,7 @@
@@ -765,7 +973,7 @@ index cbced76..ea13465 100644
  #include <rex/math.h>
  #include <rex/graphics/util/draw.h>
  #include <rex/graphics/flags.h>
-@@ -84,6 +85,14 @@ REXCVAR_DEFINE_BOOL(vulkan_hoist_shared_memory_uploads, true, "GPU/Vulkan",
+@@ -84,6 +85,23 @@ REXCVAR_DEFINE_BOOL(vulkan_hoist_shared_memory_uploads, true, "GPU/Vulkan",
                      "instead of ending the render pass for every upload")
      .lifecycle(rex::cvar::Lifecycle::kHotReload);
  
@@ -777,10 +985,19 @@ index cbced76..ea13465 100644
 +                    "320x180 pass in a 320x1024 target moved 5.7 times the memory it drew to")
 +    .lifecycle(rex::cvar::Lifecycle::kHotReload);
 +
++REXCVAR_DEFINE_BOOL(vulkan_precise_upload_hoisting, false, "GPU/Vulkan",
++                    "With vulkan_hoist_shared_memory_uploads, keep what the draws of a render "
++                    "pass read from the shared memory in bytes instead of pages, and for a "
++                    "vertex buffer on hot pages only the vertices the draw's indices reach, "
++                    "where the shader fetches by the vertex index as given. A draw otherwise "
++                    "marks its whole vertex buffer as read, and the upload of what the game "
++                    "writes next into the same buffer for the next draw ends the render pass")
++    .lifecycle(rex::cvar::Lifecycle::kHotReload);
++
  REXCVAR_DEFINE_BOOL(vulkan_dynamic_rendering, true, "GPU/Vulkan",
                      "Use VK_KHR_dynamic_rendering for Vulkan GPU emulation when supported by the "
                      "device (falls back to render passes otherwise)")
-@@ -3902,6 +3911,9 @@ bool VulkanCommandProcessor::SubmitBarriers(bool force_end_render_pass) {
+@@ -3902,6 +3920,9 @@ bool VulkanCommandProcessor::SubmitBarriers(bool force_end_render_pass) {
      }
      return false;
    }
@@ -790,7 +1007,7 @@ index cbced76..ea13465 100644
    EndRenderPass();
    for (auto it = pending_barriers_.cbegin(); it != pending_barriers_.cend(); ++it) {
      auto it_next = std::next(it);
-@@ -3956,6 +3968,8 @@ void VulkanCommandProcessor::SubmitBarriersAndEnterRenderTargetCacheRenderPass(
+@@ -3956,6 +3977,8 @@ void VulkanCommandProcessor::SubmitBarriersAndEnterRenderTargetCacheRenderPass(
      }
      in_render_pass_ = false;
      hoist_render_pass_ = false;
@@ -799,8 +1016,12 @@ index cbced76..ea13465 100644
    }
  
    current_render_pass_ = use_dynamic_rendering ? VK_NULL_HANDLE : render_pass;
-@@ -3969,6 +3983,10 @@ void VulkanCommandProcessor::SubmitBarriersAndEnterRenderTargetCacheRenderPass(
+@@ -3967,8 +3990,14 @@ void VulkanCommandProcessor::SubmitBarriersAndEnterRenderTargetCacheRenderPass(
+     hoist_point_ = deferred_command_buffer_.CmdHoistPoint();
+     ++hoist_render_pass_serial_;
      hoist_render_pass_ = true;
++    hoist_precise_ = REXCVAR_GET(vulkan_precise_upload_hoisting);
++    hoist_read_intervals_.clear();
    }
  
 +  const bool track_render_area = REXCVAR_GET(vulkan_render_area_from_scissor) &&
@@ -810,7 +1031,7 @@ index cbced76..ea13465 100644
    if (use_dynamic_rendering) {
      VkRenderingAttachmentInfo color_attachments[xenos::kMaxColorRenderTargets];
      VkRenderingAttachmentInfo depth_attachment;
-@@ -4010,6 +4028,9 @@ void VulkanCommandProcessor::SubmitBarriersAndEnterRenderTargetCacheRenderPass(
+@@ -4010,6 +4039,9 @@ void VulkanCommandProcessor::SubmitBarriersAndEnterRenderTargetCacheRenderPass(
                                                    VK_SUBPASS_CONTENTS_INLINE);
    }
    in_render_pass_ = true;
@@ -820,7 +1041,7 @@ index cbced76..ea13465 100644
  }
  
  void VulkanCommandProcessor::SubmitBarriersAndEnterRenderTargetCacheRenderPass(
-@@ -4039,6 +4060,8 @@ void VulkanCommandProcessor::SubmitBarriersAndEnterRenderTargetCacheRenderPass(
+@@ -4039,6 +4071,8 @@ void VulkanCommandProcessor::SubmitBarriersAndEnterRenderTargetCacheRenderPass(
      }
      in_render_pass_ = false;
      hoist_render_pass_ = false;
@@ -829,7 +1050,7 @@ index cbced76..ea13465 100644
    }
  
    current_render_pass_ = use_dynamic_rendering ? VK_NULL_HANDLE : render_pass;
-@@ -4107,9 +4130,12 @@ void VulkanCommandProcessor::SubmitBarriersAndEnterRenderTargetCacheRenderPass(
+@@ -4107,9 +4141,12 @@ void VulkanCommandProcessor::SubmitBarriersAndEnterRenderTargetCacheRenderPass(
  
  void VulkanCommandProcessor::EndRenderPass() {
    assert_true(submission_open_);
@@ -842,7 +1063,7 @@ index cbced76..ea13465 100644
    if (current_render_pass_ == VK_NULL_HANDLE) {
      deferred_command_buffer_.CmdVkEndRendering();
    } else {
-@@ -4119,6 +4145,52 @@ void VulkanCommandProcessor::EndRenderPass() {
+@@ -4119,6 +4156,52 @@ void VulkanCommandProcessor::EndRenderPass() {
    current_framebuffer_ = nullptr;
    in_render_pass_ = false;
    hoist_render_pass_ = false;
@@ -895,7 +1116,190 @@ index cbced76..ea13465 100644
  }
  
  // Shared memory uploads recorded before the render pass instead of ending it
-@@ -4514,6 +4586,7 @@ void VulkanCommandProcessor::SetScissor(const VkRect2D& scissor) {
+@@ -4154,6 +4237,21 @@ bool VulkanCommandProcessor::CanHoistSharedMemoryUpload(
+   if (!hoist_render_pass_ || !in_render_pass_) {
+     return false;
+   }
++  if (hoist_precise_) {
++    const uint32_t page_size_log2 = shared_memory_->page_size_log2();
++    for (const std::pair<uint32_t, uint32_t>& range : upload_page_ranges) {
++      if (!range.second) {
++        continue;
++      }
++      const uint64_t start = uint64_t(range.first) << page_size_log2;
++      const uint64_t end = std::min(uint64_t(range.first + range.second) << page_size_log2,
++                                    uint64_t(SharedMemory::kBufferSize));
++      if (start >= end || HoistReadOverlaps(uint32_t(start), uint32_t(end))) {
++        return false;
++      }
++    }
++    return true;
++  }
+   for (const std::pair<uint32_t, uint32_t>& range : upload_page_ranges) {
+     if (!range.second) {
+       continue;
+@@ -4182,11 +4280,160 @@ bool VulkanCommandProcessor::CanHoistSharedMemoryUpload(
+   return true;
+ }
+ 
++bool VulkanCommandProcessor::CanHoistSharedMemoryUploadBytes(
++    const std::vector<std::pair<uint32_t, uint32_t>>& upload_byte_ranges) const {
++  if (!hoist_render_pass_ || !in_render_pass_ || !hoist_precise_) {
++    return false;
++  }
++  for (const std::pair<uint32_t, uint32_t>& range : upload_byte_ranges) {
++    if (!range.second) {
++      continue;
++    }
++    if (range.first >= SharedMemory::kBufferSize ||
++        range.second > SharedMemory::kBufferSize - range.first ||
++        HoistReadOverlaps(range.first, range.first + range.second)) {
++      return false;
++    }
++  }
++  return true;
++}
++
++bool VulkanCommandProcessor::HoistReadOverlaps(uint32_t start, uint32_t end) const {
++  // The first interval that ends after the start.
++  auto it = std::upper_bound(
++      hoist_read_intervals_.cbegin(), hoist_read_intervals_.cend(), start,
++      [](uint32_t value, const std::pair<uint32_t, uint32_t>& interval) {
++        return value < interval.second;
++      });
++  return it != hoist_read_intervals_.cend() && it->first < end;
++}
++
++void VulkanCommandProcessor::HoistReadInsert(uint32_t start, uint32_t end) {
++  if (start >= end) {
++    return;
++  }
++  // The first interval that ends at the start or after it: it and those that
++  // follow while they begin at the end or before it become one with the new.
++  auto first = std::lower_bound(
++      hoist_read_intervals_.begin(), hoist_read_intervals_.end(), start,
++      [](const std::pair<uint32_t, uint32_t>& interval, uint32_t value) {
++        return interval.second < value;
++      });
++  auto last = first;
++  while (last != hoist_read_intervals_.end() && last->first <= end) {
++    start = std::min(start, last->first);
++    end = std::max(end, last->second);
++    ++last;
++  }
++  if (first == last) {
++    hoist_read_intervals_.insert(first, std::make_pair(start, end));
++  } else {
++    *first = std::make_pair(start, end);
++    hoist_read_intervals_.erase(first + 1, last);
++  }
++}
++
++bool VulkanCommandProcessor::GetDrawVertexIndexRange(
++    const PrimitiveProcessor::ProcessingResult& primitive_processing_result, uint32_t& first_out,
++    uint32_t& last_out) const {
++  // Only the plain case: the vertex shader gets the guest's vertex index for
++  // every host vertex (no rectangle, point or quad expansion, no tessellation).
++  if (primitive_processing_result.host_vertex_shader_type !=
++      Shader::HostVertexShaderType::kVertex) {
++    return false;
++  }
++  const RegisterFile& regs = *register_file_;
++  const auto vgt_draw_initiator = regs.Get<reg::VGT_DRAW_INITIATOR>();
++  const uint32_t count = primitive_processing_result.guest_draw_vertex_count;
++  if (!count) {
++    return false;
++  }
++  uint32_t raw_first, raw_last;
++  switch (vgt_draw_initiator.source_select) {
++    case xenos::SourceSelect::kAutoIndex:
++      raw_first = 0;
++      raw_last = count - 1;
++      break;
++    case xenos::SourceSelect::kDMA: {
++      // The guest's index buffer, as guest memory has it now (what goes to
++      // the host is uploaded from the same bytes).
++      if (count > 65536) {
++        return false;
++      }
++      const bool is_32bit = vgt_draw_initiator.index_size == xenos::IndexFormat::kInt32;
++      // As the primitive processor takes it.
++      const uint32_t base =
++          regs[XE_GPU_REG_VGT_DMA_BASE] & ~uint32_t(is_32bit ? 3 : 1);
++      const uint32_t size_bytes = count * (is_32bit ? 4 : 2);
++      if (base >= SharedMemory::kBufferSize || size_bytes > SharedMemory::kBufferSize - base) {
++        return false;
++      }
++      const xenos::Endian endian = regs.Get<reg::VGT_DMA_SIZE>().swap_mode;
++      const bool reset_enabled = regs.Get<reg::PA_SU_SC_MODE_CNTL>().multi_prim_ib_ena != 0;
++      const uint32_t reset_index =
++          regs[XE_GPU_REG_VGT_MULTI_PRIM_IB_RESET_INDX] & (is_32bit ? UINT32_MAX : UINT32_C(0xFFFF));
++      const uint8_t* indices = memory_->TranslatePhysical(base);
++      uint32_t found_first = UINT32_MAX, found_last = 0;
++      bool any = false;
++      for (uint32_t i = 0; i < count; ++i) {
++        uint32_t index;
++        if (is_32bit) {
++          uint32_t raw;
++          std::memcpy(&raw, indices + size_t(i) * 4, 4);
++          index = xenos::GpuSwap(raw, endian);
++        } else {
++          uint16_t raw;
++          std::memcpy(&raw, indices + size_t(i) * 2, 2);
++          index = xenos::GpuSwap(raw, endian);
++        }
++        if (reset_enabled && index == reset_index) {
++          continue;
++        }
++        found_first = std::min(found_first, index);
++        found_last = std::max(found_last, index);
++        any = true;
++      }
++      if (!any) {
++        return false;
++      }
++      raw_first = found_first;
++      raw_last = found_last;
++    } break;
++    default:
++      return false;
++  }
++  if (raw_last - raw_first > xenos::kVertexIndexMask) {
++    return false;
++  }
++  // As the vertex shader does: the base index, the 24-bit mask, the clamp.
++  const uint32_t base_index = uint32_t(regs.Get<int32_t>(XE_GPU_REG_VGT_INDX_OFFSET));
++  uint32_t first = (raw_first + base_index) & xenos::kVertexIndexMask;
++  uint32_t last = (raw_last + base_index) & xenos::kVertexIndexMask;
++  if (first > last) {
++    // The mask wrapped somewhere in between.
++    return false;
++  }
++  const uint32_t index_min = regs.Get<uint32_t>(XE_GPU_REG_VGT_MIN_VTX_INDX);
++  const uint32_t index_max = regs.Get<uint32_t>(XE_GPU_REG_VGT_MAX_VTX_INDX);
++  first = std::min(std::max(first, index_min), index_max);
++  last = std::min(std::max(last, index_min), index_max);
++  if (first > last) {
++    return false;
++  }
++  first_out = first;
++  last_out = last;
++  return true;
++}
++
+ void VulkanCommandProcessor::MarkSharedMemoryReadInRenderPass(uint32_t start, uint32_t length) {
+   if (!hoist_render_pass_ || !length || start >= SharedMemory::kBufferSize) {
+     return;
+   }
+   length = std::min(length, SharedMemory::kBufferSize - start);
++  if (hoist_precise_) {
++    HoistReadInsert(start, start + length);
++    return;
++  }
+   uint32_t page_size_log2 = shared_memory_->page_size_log2();
+   uint32_t page_first = start >> page_size_log2;
+   uint32_t page_last = (start + length - 1) >> page_size_log2;
+@@ -4514,6 +4761,7 @@ void VulkanCommandProcessor::SetScissor(const VkRect2D& scissor) {
      dynamic_scissor_ = scissor;
      deferred_command_buffer_.CmdVkSetScissor(0, 1, &dynamic_scissor_);
      dynamic_scissor_update_needed_ = false;
@@ -903,7 +1307,78 @@ index cbced76..ea13465 100644
    }
  }
  
-@@ -6186,6 +6259,7 @@ bool VulkanCommandProcessor::HostOcclusionQueryBegin() {
+@@ -5127,6 +5375,15 @@ bool VulkanCommandProcessor::IssueDraw(xenos::PrimitiveType prim_type, uint32_t
+   // What this draw reads from the shared memory: no upload into it can go
+   // before this render pass any more (CanHoistSharedMemoryUpload).
+   if (hoist_render_pass_) {
++    // With vulkan_precise_upload_hoisting, of a vertex buffer that has hot
++    // pages (the only ones uploaded again and again) only the vertices the
++    // draw's indices reach, where the shader fetches by the vertex index as
++    // given; the indices' range is looked for once a draw, when first needed.
++    const bool precise_possible = hoist_precise_ && memexport_ranges_.empty() &&
++                                  !memexport_writes_possible;
++    bool vertex_index_range_looked_for = false;
++    bool vertex_index_range_known = false;
++    uint32_t vertex_index_first = 0, vertex_index_last = 0;
+     for (const Shader* shader : {static_cast<const Shader*>(vertex_shader),
+                                  static_cast<const Shader*>(pixel_shader)}) {
+       if (!shader) {
+@@ -5138,9 +5395,51 @@ bool VulkanCommandProcessor::IssueDraw(xenos::PrimitiveType prim_type, uint32_t
+         uint32_t j;
+         while (rex::bit_scan_forward(vfetch_bits_remaining, &j)) {
+           vfetch_bits_remaining &= ~(uint32_t(1) << j);
+-          xenos::xe_gpu_vertex_fetch_t vfetch_constant = regs.GetVertexFetch(i * 32 + j);
+-          MarkSharedMemoryReadInRenderPass(vfetch_constant.address << 2,
+-                                           vfetch_constant.size << 2);
++          const uint32_t vfetch_index = i * 32 + j;
++          xenos::xe_gpu_vertex_fetch_t vfetch_constant = regs.GetVertexFetch(vfetch_index);
++          uint32_t read_start = vfetch_constant.address << 2;
++          uint32_t read_length = vfetch_constant.size << 2;
++          if (precise_possible && shader == vertex_shader && read_length &&
++              shared_memory_->IsAnyPageHotInRange(read_start, read_length)) {
++            const Shader::VertexBinding* binding = nullptr;
++            for (const Shader::VertexBinding& candidate : vertex_shader->vertex_bindings()) {
++              if (candidate.fetch_constant == vfetch_index) {
++                binding = &candidate;
++                break;
++              }
++            }
++            if (binding && binding->index_is_vertex_index && binding->stride_words) {
++              if (!vertex_index_range_looked_for) {
++                vertex_index_range_looked_for = true;
++                vertex_index_range_known = GetDrawVertexIndexRange(
++                    primitive_processing_result, vertex_index_first, vertex_index_last);
++              }
++              if (vertex_index_range_known) {
++                // The words of a vertex that the binding's fetches read, from
++                // the vertex's first word (the offsets are signed).
++                int64_t words_first = INT64_MAX, words_end = INT64_MIN;
++                for (const Shader::VertexBinding::Attribute& attribute : binding->attributes) {
++                  const int64_t offset = attribute.fetch_instr.attributes.offset;
++                  words_first = std::min(words_first, offset);
++                  words_end = std::max(words_end, offset + 4);
++                }
++                const int64_t buffer_start = int64_t(read_start);
++                const int64_t buffer_end = buffer_start + read_length;
++                const int64_t stride = binding->stride_words;
++                int64_t exact_start =
++                    buffer_start + (int64_t(vertex_index_first) * stride + words_first) * 4;
++                int64_t exact_end =
++                    buffer_start + (int64_t(vertex_index_last) * stride + words_end) * 4;
++                exact_start = std::max(exact_start, buffer_start);
++                exact_end = std::min(exact_end, buffer_end);
++                if (exact_start < exact_end) {
++                  read_start = uint32_t(exact_start);
++                  read_length = uint32_t(exact_end - exact_start);
++                }
++              }
++            }
++          }
++          MarkSharedMemoryReadInRenderPass(read_start, read_length);
+         }
+       }
+     }
+@@ -6186,6 +6485,7 @@ bool VulkanCommandProcessor::HostOcclusionQueryBegin() {
  
    // Begun (and ended) outside a render pass: a query begun inside one has to end in the same
    // subpass. The draws of the render passes in between are counted all the same.
@@ -911,7 +1386,7 @@ index cbced76..ea13465 100644
    EndRenderPass();
  
    DeferredCommandBuffer& command_buffer = deferred_command_buffer();
-@@ -6207,6 +6281,7 @@ void VulkanCommandProcessor::HostOcclusionQueryAbandon() {
+@@ -6207,6 +6507,7 @@ void VulkanCommandProcessor::HostOcclusionQueryAbandon() {
    active_occlusion_query_ = {};
    // A query is recording only while its submission is open (the end of the submission ends it).
    if (occlusion_query_pool_ != VK_NULL_HANDLE && submission_open_) {
@@ -919,7 +1394,7 @@ index cbced76..ea13465 100644
      EndRenderPass();
      deferred_command_buffer_.CmdVkEndQuery(occlusion_query_pool_, host_index);
    }
-@@ -6226,6 +6301,7 @@ bool VulkanCommandProcessor::HostOcclusionQueryEnd(uint32_t& host_index_out,
+@@ -6226,6 +6527,7 @@ bool VulkanCommandProcessor::HostOcclusionQueryEnd(uint32_t& host_index_out,
      return false;
    }
  
@@ -927,7 +1402,7 @@ index cbced76..ea13465 100644
    EndRenderPass();
  
    // The count is copied to the readback buffer in the same command buffer (the copy waits for the
-@@ -6564,6 +6640,7 @@ bool VulkanCommandProcessor::BeginSubmission(bool is_guest_command) {
+@@ -6564,6 +6866,7 @@ bool VulkanCommandProcessor::BeginSubmission(bool is_guest_command) {
      current_framebuffer_ = nullptr;
      in_render_pass_ = false;
      hoist_render_pass_ = false;
@@ -935,7 +1410,7 @@ index cbced76..ea13465 100644
      current_guest_graphics_pipeline_ = VK_NULL_HANDLE;
      current_external_graphics_pipeline_ = VK_NULL_HANDLE;
      current_external_compute_pipeline_ = VK_NULL_HANDLE;
-@@ -6724,12 +6801,14 @@ bool VulkanCommandProcessor::EndSubmission(bool is_swap) {
+@@ -6724,12 +7027,14 @@ bool VulkanCommandProcessor::EndSubmission(bool is_swap) {
  
      if (active_occlusion_query_.valid && occlusion_query_pool_ != VK_NULL_HANDLE) {
        // Begun outside a render pass, so it ends outside one (the guest's end then finds it cut).
@@ -1050,18 +1525,23 @@ index 0a03c6b..35f4ed4 100644
        command_buffer.CmdVkDispatch(
            (draw_resolution_scale_x() *
 diff --git a/src/graphics/vulkan/shared_memory.cpp b/src/graphics/vulkan/shared_memory.cpp
-index ebc998e..cfede5f 100644
+index ebc998e..a61129a 100644
 --- a/src/graphics/vulkan/shared_memory.cpp
 +++ b/src/graphics/vulkan/shared_memory.cpp
-@@ -288,6 +288,7 @@ bool VulkanSharedMemory::UploadByteRanges(
-   bool hoist = BeginHoistedUpload(hoist_page_ranges_temp_);
+@@ -285,9 +285,11 @@ bool VulkanSharedMemory::UploadByteRanges(
+           page_first, ((range.first + range.second - 1) >> page_size_log2()) - page_first + 1);
+     }
+   }
+-  bool hoist = BeginHoistedUpload(hoist_page_ranges_temp_);
++  bool hoist = command_processor_.hoist_precise() ? BeginHoistedUploadBytes(upload_byte_ranges)
++                                                  : BeginHoistedUpload(hoist_page_ranges_temp_);
    if (!hoist) {
      Use(Usage::kTransferDestination, std::make_pair(bounds_start, bounds_end - bounds_start));
 +    command_processor_.SetPassEndReason(10);
      command_processor_.SubmitBarriers(true);
    }
    DeferredCommandBuffer& command_buffer = command_processor_.deferred_command_buffer();
-@@ -351,6 +352,7 @@ bool VulkanSharedMemory::UploadRanges(
+@@ -351,6 +353,7 @@ bool VulkanSharedMemory::UploadRanges(
                         (upload_page_ranges.back().first + upload_page_ranges.back().second -
                          upload_page_ranges.front().first)
                             << page_size_log2()));
@@ -1069,6 +1549,31 @@ index ebc998e..cfede5f 100644
      command_processor_.SubmitBarriers(true);
    }
    DeferredCommandBuffer& command_buffer = command_processor_.deferred_command_buffer();
+@@ -434,6 +437,24 @@ bool VulkanSharedMemory::BeginHoistedUpload(
+   return true;
+ }
+ 
++bool VulkanSharedMemory::BeginHoistedUploadBytes(
++    const std::vector<std::pair<uint32_t, uint32_t>>& upload_byte_ranges) {
++  if (last_usage_ != Usage::kRead || last_written_range_.second ||
++      !command_processor_.CanHoistSharedMemoryUploadBytes(upload_byte_ranges)) {
++    return false;
++  }
++  command_processor_.BeginHoistedCommands();
++  uint64_t hoist_render_pass_serial = command_processor_.hoist_render_pass_serial();
++  if (hoist_render_pass_serial_ != hoist_render_pass_serial) {
++    hoist_render_pass_serial_ = hoist_render_pass_serial;
++    WriteUsageBarrier(Usage::kRead, Usage::kTransferDestination);
++  } else {
++    command_processor_.deferred_command_buffer().TruncateHoistedStream(
++        hoist_closing_barrier_offset_);
++  }
++  return true;
++}
++
+ void VulkanSharedMemory::EndHoistedUpload(
+     const std::vector<std::pair<uint32_t, uint32_t>>& upload_byte_ranges) {
+   hoist_closing_barrier_offset_ = command_processor_.deferred_command_buffer().hoisted_stream_size();
 diff --git a/src/graphics/vulkan/texture_cache.cpp b/src/graphics/vulkan/texture_cache.cpp
 index 582b85d..5b3fafe 100644
 --- a/src/graphics/vulkan/texture_cache.cpp
